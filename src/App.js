@@ -120,13 +120,26 @@ function computeOptimalRaan(sat, anchorCty) {
   function firstSunlitDay(testRaan) {
     const testSat = { ...sat, raan: testRaan, eccentricity: sat.eccentricity || 0, count: 1 };
     const pts = groundTrack(testSat, nOrbits5, 300);
-    for (const p of pts) {
-      if (p.lat >= anchorCty.latMin - latBuf && p.lat <= anchorCty.latMax + latBuf &&
-          p.lon >= anchorCty.lonMin - lonBuf && p.lon <= anchorCty.lonMax + lonBuf &&
-          isInImagingWindow(p.t, targetLat, targetLon)) {
-        return p.t / 86400;
+    // For each buffer-zone pass, find the point closest to (targetLat, targetLon).
+    // Return the closest-approach time if sunlit — ensures RAAN centers the orbit over
+    // the country, not just the buffer edge (critical for equatorial orbits).
+    let inPass = false, closestDist = Infinity, closestT = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const over = p.lat >= anchorCty.latMin - latBuf && p.lat <= anchorCty.latMax + latBuf &&
+                   p.lon >= anchorCty.lonMin - lonBuf && p.lon <= anchorCty.lonMax + lonBuf;
+      if (over) {
+        const dLat = (p.lat - targetLat) * 111.32;
+        const dLon = (p.lon - targetLon) * 111.32 * Math.cos(targetLat * DEG);
+        const dist = Math.sqrt(dLat * dLat + dLon * dLon);
+        if (dist < closestDist) { closestDist = dist; closestT = p.t; }
+        inPass = true;
+      } else if (inPass) {
+        if (isInImagingWindow(closestT, targetLat, targetLon)) return closestT / 86400;
+        inPass = false; closestDist = Infinity; closestT = Infinity;
       }
     }
+    if (inPass && isInImagingWindow(closestT, targetLat, targetLon)) return closestT / 86400;
     return Infinity;
   }
 
@@ -1001,8 +1014,9 @@ export default function App() {
     const result = {};
     for (const sat of sats) {
       const effSat = satWithAnchorRaan(sat, anchorObj);
-      const { passes } = computePasses(effSat, anchorObj, 1); // 1 day is enough — RAAN is optimized
-      result[sat.id] = passes.length > 0 ? passes[0][0].t : 0;
+      const { passes } = computePasses(effSat, anchorObj, 5); // 5 days: handles slow sunlit optimization
+      // Use the mid-indexed point of the first pass — matches computePasses passMidTimes formula
+      result[sat.id] = passes.length > 0 ? passes[0][Math.floor(passes[0].length / 2)].t : 0;
     }
     return result;
   }, [sats, anchorCty]);
@@ -1030,11 +1044,13 @@ export default function App() {
         // If anchor is set, override RAAN to optimize first pass over anchor country
         const effectiveSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
 
-        // Find time (seconds) of anchor's first pass — day 0 for all revisit buckets
+        // Find time (seconds) of anchor's first pass mid-point — day 0 for all revisit buckets.
+        // Use 5 days and mid-indexed point to match anchorFirstPassTimes and computePasses.
         let anchorFirstPassT = 0;
         if (anchorObj) {
-          const { passes: anchorPasses } = computePasses(effectiveSat, anchorObj, 1);
-          anchorFirstPassT = anchorPasses.length > 0 ? anchorPasses[0][0].t : 0;
+          const { passes: anchorPasses } = computePasses(effectiveSat, anchorObj, 5);
+          anchorFirstPassT = anchorPasses.length > 0
+            ? anchorPasses[0][Math.floor(anchorPasses[0].length / 2)].t : 0;
         }
         const anchorOffsetDays = anchorFirstPassT / 86400;
 
@@ -1078,56 +1094,59 @@ export default function App() {
           // Detect all passes (time-gap based).
           // Collect ALL buffer-zone points per pass, then call passTrackLength() which
           // uses haversine over those points and caps at the country diagonal.
+          // Detect all passes over the country buffer zone.
+          // midT = middle-indexed point time — matches computePasses passMidTimes formula exactly,
+          // so sunlit classification and window filtering are consistent with CountryTrackMap.
           const allPasses = [];
           let curP = null;
+          const flushPass = () => {
+            const midIdx = Math.floor(curP.points.length / 2);
+            const midT = curP.points[midIdx].t;
+            allPasses.push({ midT, trackLengthKm: passTrackLength(curP.points, cty) });
+            curP = null;
+          };
           for (let pi = 0; pi < trackPts.length; pi++) {
             const p = trackPts[pi];
             const overBuf = p.lat >= cty.latMin - latBuf && p.lat <= cty.latMax + latBuf &&
                             p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
             if (overBuf) {
               if (!curP) {
-                curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400, points: [p] };
+                curP = { points: [p] };
               } else {
-                const dt = p.t / 86400 - curP.startDay;
-                if (dt > T / 86400 * 0.4) {
-                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2,
-                                   trackLengthKm: passTrackLength(curP.points, cty) });
-                  curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400, points: [p] };
-                } else {
-                  curP.lastT = p.t;
-                  curP.points.push(p);
-                }
+                const dt = p.t - curP.points[curP.points.length - 1].t;
+                if (dt > T * 0.4) { flushPass(); curP = { points: [p] }; }
+                else curP.points.push(p);
               }
             } else if (curP) {
-              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2,
-                               trackLengthKm: passTrackLength(curP.points, cty) });
-              curP = null;
+              flushPass();
             }
           }
-          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2,
-                                     trackLengthKm: passTrackLength(curP.points, cty) });
+          if (curP) flushPass();
+
+          // All filtering uses midT/86400 (days) — matches computePasses window logic exactly
+          const inWindow = (p, start, end) => p.midT / 86400 >= start && p.midT / 86400 <= end;
 
           for (const bucket of passBuckets) {
             passCountByTf[bucket] = allPasses.filter(p =>
-              p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
+              inWindow(p, anchorOffsetDays, anchorOffsetDays + bucket)
             ).length;
           }
 
-          // Sunlit-only passes
+          // Sunlit-only passes — midT matches computePasses passMidTimes formula
           const ctyMidLat = (cty.latMin + cty.latMax) / 2;
           const ctyMidLon = (cty.lonMin + cty.lonMax) / 2;
           const sunlitPasses = allPasses.filter(p => isInImagingWindow(p.midT, ctyMidLat, ctyMidLon));
           const sunlitPassCountByTf = {};
           for (const bucket of passBuckets) {
             sunlitPassCountByTf[bucket] = sunlitPasses.filter(p =>
-              p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
+              inWindow(p, anchorOffsetDays, anchorOffsetDays + bucket)
             ).length;
           }
 
-          // Pass-day-based revisit metrics (from detected pass list, not grid cells)
+          // Pass-day-based revisit metrics
           const allPassDays30 = allPasses
-            .filter(p => p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + 30)
-            .map(p => p.day - anchorOffsetDays).sort((a, b) => a - b);
+            .filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30))
+            .map(p => p.midT / 86400 - anchorOffsetDays).sort((a, b) => a - b);
           const firstAllPassDay = allPassDays30.length > 0 ? allPassDays30[0] : null;
           const meanRevisitDays = allPassDays30.length > 1
             ? (allPassDays30[allPassDays30.length - 1] - allPassDays30[0]) / (allPassDays30.length - 1)
@@ -1137,8 +1156,8 @@ export default function App() {
             : null;
 
           const sunlitPassDays30 = sunlitPasses
-            .filter(p => p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + 30)
-            .map(p => p.day - anchorOffsetDays).sort((a, b) => a - b);
+            .filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30))
+            .map(p => p.midT / 86400 - anchorOffsetDays).sort((a, b) => a - b);
           const firstSunlitPassDay = sunlitPassDays30.length > 0 ? sunlitPassDays30[0] : null;
           const sunlitMeanRevisitDays = sunlitPassDays30.length > 1
             ? (sunlitPassDays30[sunlitPassDays30.length - 1] - sunlitPassDays30[0]) / (sunlitPassDays30.length - 1)
@@ -1148,12 +1167,11 @@ export default function App() {
             : null;
 
           // Covered area per timeframe (sunlit passes × swath × track length, capped at daily capacity)
-          const vGround = 2 * Math.PI * R_E / T; // km/s subsatellite ground speed
           const coveredAreaSunlitByTf = {};
           const uncappedSunlitAreaByTf = {};
           for (const bucket of passBuckets) {
             const inBucket = sunlitPasses.filter(p =>
-              p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
+              inWindow(p, anchorOffsetDays, anchorOffsetDays + bucket)
             );
             const uncapped = inBucket.reduce((s, p) => s + sw * p.trackLengthKm, 0);
             uncappedSunlitAreaByTf[bucket] = uncapped;
@@ -1161,16 +1179,15 @@ export default function App() {
             coveredAreaSunlitByTf[bucket] = cap > 0 ? Math.min(uncapped, cap) : uncapped;
           }
           // Average sunlit pass track length over the 30-day window
-          const sunlitIn30 = sunlitPasses.filter(p => p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + 30);
+          const sunlitIn30 = sunlitPasses.filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30));
           const avgSunlitPassLengthKm = sunlitIn30.length > 0
             ? sunlitIn30.reduce((s, p) => s + p.trackLengthKm, 0) / sunlitIn30.length
             : 0;
 
           // Per-day sunlit coverage (uncapped) for computing max-single-day potential.
-          // dayIdx 0 = anchor day 0, bucketed by Math.floor(pass.day - anchorOffsetDays).
           const sunlitCoveragePerDay = new Float64Array(30);
           for (const p of sunlitIn30) {
-            const di = Math.floor(p.day - anchorOffsetDays);
+            const di = Math.floor(p.midT / 86400 - anchorOffsetDays);
             if (di >= 0 && di < 30) sunlitCoveragePerDay[di] += sw * p.trackLengthKm;
           }
           // Diagnostic: log TRACE over Rwanda to verify track length after clipping fix
