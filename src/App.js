@@ -879,7 +879,7 @@ export default function App() {
   const [results, setResults] = useState(null);
   const [running, setRunning] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
-  const [commercialRate, setCommercialRate] = useState(20); // $/km²
+  const [commercialRate, setCommercialRate] = useState(15); // $/km²
   const [form, setForm] = useState({
     name: "", altitude: 500, inclination: 97.4, eccentricity: 0.001,
     raan: 0, argPerigee: 0, swathAngle: 12, offNadir: 30, dataCapacity: 500000, lifetime: 5
@@ -979,8 +979,9 @@ export default function App() {
           const lonBuf = 1.5;
           
           // Detect all passes (time-gap based).
-          // durationSec is clipped to strict country bounds (no buffer) so coverage
-          // area calculations reflect only ground actually inside the country.
+          // trackLengthKm is accumulated only for segments where both consecutive points
+          // are inside the strict country bounds (no buffer). This way a pass that just
+          // clips the corner still gets a non-zero length if ≥2 consecutive inside points.
           const allPasses = [];
           let curP = null;
           for (let pi = 0; pi < trackPts.length; pi++) {
@@ -989,35 +990,34 @@ export default function App() {
                             p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
             const overCty = p.lat >= cty.latMin && p.lat <= cty.latMax &&
                             p.lon >= cty.lonMin && p.lon <= cty.lonMax;
-            function flushPass(cp) {
-              // durationSec = time spent inside actual country bounds (not buffer)
-              const dur = cp.ctyLastT !== null ? cp.ctyLastT - cp.ctyStartT : 0;
-              allPasses.push({ day: cp.startDay, midT: (cp.startT + cp.lastT) / 2, durationSec: dur });
-            }
             if (overBuf) {
               if (!curP) {
                 curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400,
-                         ctyStartT: overCty ? p.t : null, ctyLastT: overCty ? p.t : null };
+                         trackLengthKm: 0, prevPt: p, prevCty: overCty };
               } else {
                 const dt = p.t / 86400 - curP.startDay;
                 if (dt > T / 86400 * 0.4) {
-                  flushPass(curP);
+                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, trackLengthKm: curP.trackLengthKm });
                   curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400,
-                           ctyStartT: overCty ? p.t : null, ctyLastT: overCty ? p.t : null };
+                           trackLengthKm: 0, prevPt: p, prevCty: overCty };
                 } else {
                   curP.lastT = p.t;
-                  if (overCty) {
-                    if (curP.ctyStartT === null) curP.ctyStartT = p.t;
-                    curP.ctyLastT = p.t;
+                  if (overCty && curP.prevCty) {
+                    const dlat = (p.lat - curP.prevPt.lat) * 111.32;
+                    const mLat = (p.lat + curP.prevPt.lat) / 2;
+                    const dlon = (p.lon - curP.prevPt.lon) * Math.cos(mLat * DEG) * 111.32;
+                    curP.trackLengthKm += Math.sqrt(dlat * dlat + dlon * dlon);
                   }
+                  curP.prevPt = p;
+                  curP.prevCty = overCty;
                 }
               }
             } else if (curP) {
-              flushPass(curP);
+              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, trackLengthKm: curP.trackLengthKm });
               curP = null;
             }
           }
-          if (curP) { const dur = curP.ctyLastT !== null ? curP.ctyLastT - curP.ctyStartT : 0; allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: dur }); }
+          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, trackLengthKm: curP.trackLengthKm });
 
           for (const bucket of passBuckets) {
             passCountByTf[bucket] = allPasses.filter(p =>
@@ -1044,7 +1044,7 @@ export default function App() {
             const inBucket = sunlitPasses.filter(p =>
               p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
             );
-            const uncapped = inBucket.reduce((s, p) => s + sw * vGround * p.durationSec, 0);
+            const uncapped = inBucket.reduce((s, p) => s + sw * p.trackLengthKm, 0);
             uncappedSunlitAreaByTf[bucket] = uncapped;
             const cap = (effectiveSat.dataCapacity || 0) * bucket;
             coveredAreaSunlitByTf[bucket] = cap > 0 ? Math.min(uncapped, cap) : uncapped;
@@ -1052,7 +1052,7 @@ export default function App() {
           // Average sunlit pass track length over the 30-day window
           const sunlitIn30 = sunlitPasses.filter(p => p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + 30);
           const avgSunlitPassLengthKm = sunlitIn30.length > 0
-            ? sunlitIn30.reduce((s, p) => s + vGround * p.durationSec, 0) / sunlitIn30.length
+            ? sunlitIn30.reduce((s, p) => s + p.trackLengthKm, 0) / sunlitIn30.length
             : 0;
 
           // Grid dimensions (shared by all-pass and sunlit analysis)
@@ -1817,48 +1817,104 @@ export default function App() {
               ))}
             </div>
 
-            {/* ── DETAILED MAPPING TABLE ── */}
+            {/* ── COMMERCIAL IMAGERY VALUE ── */}
             <P style={{ padding: 14, marginBottom: 14 }}>
-              <Lbl>DETAILED MAPPING METRICS</Lbl>
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
-                  <thead>
-                    <tr style={{ borderBottom: "2px solid rgba(70,140,200,0.15)" }}>
-                      {["Satellite", "Country", "Area", "Swath", "Cap/day", "☁", "100% Cov", "Covs/yr", "Lifetime", "Passes", "Status"].map(h => (
-                        <th key={h} style={{ textAlign: "left", padding: "6px 7px", color: "#2a5a78", fontWeight: 600, fontSize: 8, letterSpacing: 0.8 }}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {results.map((r, i) => {
-                      const sat = sats.find(s => s.id === r.satId);
-                      const sw = sat ? effSwathKm(sat.altitude, sat.swathAngle) : 0;
-                      return (
-                        <tr key={i} style={{ borderBottom: "1px solid rgba(70,140,200,0.05)" }}>
-                          <td style={{ padding: "6px 7px", color: r.satColor, fontWeight: 600 }}>{r.satName}</td>
-                          <td style={{ padding: "6px 7px" }}>{r.countryName}</td>
-                          <td style={{ padding: "6px 7px", color: "#4a7890" }}>{fmt(r.area)} km²</td>
-                          <td style={{ padding: "6px 7px", color: "#4a7890" }}>{sw.toFixed(0)} km</td>
-                          <td style={{ padding: "6px 7px", color: "#4a7890" }}>{sat ? fmt(sat.dataCapacity) : "-"}</td>
-                          <td style={{ padding: "6px 7px", color: r.cloudPct > 60 ? "#FF8A80" : "#80a8c0" }}>{r.cloudPct}%</td>
-                          <td style={{ padding: "6px 7px", fontWeight: 700, color: r.fullCovDay ? "#64FFDA" : "#FF8A80" }}>{r.fullCovDay ? `D${r.fullCovDay.toFixed(1)}` : `>D${tf}`}</td>
-                          <td style={{ padding: "6px 7px", color: "#a0d0e8" }}>{r.covsPerYear.toFixed(1)}</td>
-                          <td style={{ padding: "6px 7px", color: "#FFD740" }}>{r.lifetime} yr</td>
-                          <td style={{ padding: "6px 7px", color: "#80a8c0" }}>{r.passLines.length}</td>
-                          <td style={{ padding: "6px 7px" }}>
-                            <span style={{
-                              padding: "2px 6px", borderRadius: 3, fontSize: 8, fontWeight: 600,
-                              background: r.finalPct >= 100 ? "rgba(100,255,218,0.1)" : r.finalPct >= 50 ? "rgba(255,215,0,0.1)" : "rgba(255,100,100,0.1)",
-                              color: r.finalPct >= 100 ? "#64FFDA" : r.finalPct >= 50 ? "#FFD740" : "#FF8A80",
-                              border: `1px solid ${r.finalPct >= 100 ? "rgba(100,255,218,0.25)" : r.finalPct >= 50 ? "rgba(255,215,0,0.25)" : "rgba(255,100,100,0.25)"}`
-                            }}>{r.finalPct >= 100 ? "COMPLETE" : r.finalPct >= 50 ? "PARTIAL" : "INSUFFICIENT"}</span>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <Lbl style={{ marginBottom: 0 }}>COMMERCIAL IMAGERY VALUE</Lbl>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 8, color: "#3a6080", letterSpacing: 1 }}>RATE</span>
+                  <input type="number" min="0" step="1" value={commercialRate}
+                    onChange={e => setCommercialRate(+e.target.value || 0)}
+                    style={{ width: 56, background: "rgba(4,8,16,0.9)", border: "1px solid rgba(70,140,200,0.25)", color: "#FFD740", padding: "3px 5px", borderRadius: 3, fontSize: 10, fontFamily: "inherit", textAlign: "center" }} />
+                  <span style={{ fontSize: 8, color: "#2a4a60" }}>$/km²</span>
+                </div>
               </div>
+              {sats.map(sat => {
+                const satResults = results.filter(r => r.satId === sat.id);
+                if (!satResults.length) return null;
+                const dailyCap = satResults[0].satDataCapacity;
+                const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30] || 0) / 30), 0);
+                const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
+                const imgPerMonth = effectiveDaily * 30.44;
+                const imgPerYear = effectiveDaily * 365.25;
+                const imgLifetime = imgPerYear * (satResults[0].satLifetime || 5);
+                const valuePerYear = imgPerYear * commercialRate;
+                const valueLifetime = imgLifetime * commercialRate;
+                return (
+                  <div key={sat.id} style={{ marginBottom: 12, padding: "12px 14px", background: "rgba(4,8,16,0.6)", borderRadius: "0 6px 6px 0", border: "1px solid rgba(70,140,200,0.1)", borderLeft: `3px solid ${sat.color}` }}>
+                    {/* Header */}
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                      <span style={{ color: sat.color, fontWeight: 700, fontSize: 11 }}>{sat.name}</span>
+                      <span style={{ fontSize: 8, color: "#3a6080" }}>{sat.altitude}km · {effSwathKm(sat.altitude, sat.swathAngle).toFixed(0)}km swath · {satResults[0].satLifetime}yr lifetime</span>
+                    </div>
+
+                    {/* Imagery volume */}
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginBottom: 10 }}>
+                      {[
+                        ["Sunlit imagery / mo", `${fmt(imgPerMonth)} km²`, "#a0d0e8"],
+                        ["Sunlit imagery / yr", `${fmt(imgPerYear)} km²`, "#FFD740"],
+                        ["Sunlit imagery / lifetime", `${fmt(imgLifetime)} km²`, "#64FFDA"],
+                      ].map(([k, v, c]) => (
+                        <div key={k} style={{ padding: "6px 8px", background: "rgba(0,0,0,0.35)", borderRadius: 4 }}>
+                          <div style={{ fontSize: 7, color: "#2a4a60", letterSpacing: 1, marginBottom: 2 }}>{k.toUpperCase()}</div>
+                          <div style={{ fontSize: 11, color: c, fontWeight: 700 }}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Commercial value */}
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }}>
+                      {[
+                        ["Commercial value / yr", `${fmtMoney(valuePerYear)}`, "#76FF03"],
+                        ["Commercial value / lifetime", `${fmtMoney(valueLifetime)}`, "#69FF47"],
+                      ].map(([k, v, c]) => (
+                        <div key={k} style={{ padding: "7px 10px", background: "rgba(70,255,100,0.04)", border: "1px solid rgba(70,255,100,0.12)", borderRadius: 4 }}>
+                          <div style={{ fontSize: 7, color: "#2a5a40", letterSpacing: 1, marginBottom: 3 }}>{k.toUpperCase()}</div>
+                          <div style={{ fontSize: 13, color: c, fontWeight: 700 }}>{v}</div>
+                          <div style={{ fontSize: 8, color: "#2a4a30", marginTop: 1 }}>@ ${commercialRate}/km²</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Per-country breakdown */}
+                    <div style={{ fontSize: 7, color: "#2a4060", letterSpacing: 1, marginBottom: 5 }}>PER-COUNTRY IMAGERY</div>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
+                      <thead>
+                        <tr style={{ borderBottom: "1px solid rgba(70,140,200,0.12)" }}>
+                          {["Country", "Passes/30d", "Avg track", "km²/yr", "Value/yr", "Share"].map((h, hi) => (
+                            <th key={hi} style={{ padding: "3px 6px", textAlign: hi === 0 ? "left" : "right", color: "#2a5068", fontSize: 7, letterSpacing: 0.7, fontWeight: 600 }}>{h.toUpperCase()}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {satResults.map((r, ri) => {
+                          const passesPerYear = (r.sunlitPassCountByTf[30] || 0) * (365.25 / 30);
+                          const annualKm2 = passesPerYear * r.avgSunlitPassLengthKm * r.swKm;
+                          const annualValue = annualKm2 * commercialRate;
+                          const share = imgPerYear > 0 ? (annualKm2 / imgPerYear * 100) : 0;
+                          return (
+                            <tr key={ri} style={{ borderBottom: "1px solid rgba(70,140,200,0.04)" }}>
+                              <td style={{ padding: "5px 6px", color: "#80a8c0", fontWeight: 600 }}>{r.countryName}</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#a0d0e8" }}>{r.sunlitPassCountByTf[30] || 0}</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#a0d0e8" }}>{r.avgSunlitPassLengthKm.toFixed(0)} km</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#FFD740" }}>{fmt(annualKm2)} km²</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#76FF03" }}>{fmtMoney(annualValue)}</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right" }}>
+                                <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }}>
+                                  <div style={{ width: 36, height: 4, background: "rgba(70,140,200,0.1)", borderRadius: 2 }}>
+                                    <div style={{ width: `${Math.min(share, 100)}%`, height: "100%", background: sat.color, borderRadius: 2, opacity: 0.7 }} />
+                                  </div>
+                                  <span style={{ color: "#80c0d8", minWidth: 28, textAlign: "right" }}>{share.toFixed(0)}%</span>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })}
             </P>
           </>}
 
