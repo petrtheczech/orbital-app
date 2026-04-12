@@ -453,13 +453,19 @@ function computePasses(sat, cty, numDays, startT = 0) {
   }
   const pct = (cov.reduce((s, v) => s + v, 0) / (gN * gN) * 100).toFixed(1);
   const passMidTimes = passes.map(pass => pass[Math.floor(pass.length / 2)].t);
-  // Ground track length over the country for each pass (sum of segment distances)
+  // Ground track length clipped to actual country bounds (no buffer) for each pass.
+  // Buffer is used only for pass detection; coverage measurement uses strict bounds.
   const passLengthsKm = passes.map(pass => {
     let len = 0;
     for (let i = 1; i < pass.length; i++) {
-      const dlat = (pass[i].lat - pass[i-1].lat) * 111.32;
-      const midLat = (pass[i].lat + pass[i-1].lat) / 2;
-      const dlon = (pass[i].lon - pass[i-1].lon) * Math.cos(midLat * DEG) * 111.32;
+      const p0 = pass[i - 1], p1 = pass[i];
+      // Only count a segment if both endpoints are inside the actual country bounds
+      const p0in = p0.lat >= cty.latMin && p0.lat <= cty.latMax && p0.lon >= cty.lonMin && p0.lon <= cty.lonMax;
+      const p1in = p1.lat >= cty.latMin && p1.lat <= cty.latMax && p1.lon >= cty.lonMin && p1.lon <= cty.lonMax;
+      if (!p0in || !p1in) continue;
+      const dlat = (p1.lat - p0.lat) * 111.32;
+      const midLat = (p1.lat + p0.lat) / 2;
+      const dlon = (p1.lon - p0.lon) * Math.cos(midLat * DEG) * 111.32;
       len += Math.sqrt(dlat * dlat + dlon * dlon);
     }
     return len;
@@ -972,28 +978,46 @@ export default function App() {
           const latBuf = swDegLat / 2 + 0.8;
           const lonBuf = 1.5;
           
-          // Detect all passes (time-gap based), each stored as {day, midT, durationSec}
+          // Detect all passes (time-gap based).
+          // durationSec is clipped to strict country bounds (no buffer) so coverage
+          // area calculations reflect only ground actually inside the country.
           const allPasses = [];
           let curP = null;
           for (let pi = 0; pi < trackPts.length; pi++) {
             const p = trackPts[pi];
-            const over = p.lat >= cty.latMin - latBuf && p.lat <= cty.latMax + latBuf &&
-                         p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
-            if (over) {
-              if (!curP) { curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400 }; }
-              else {
+            const overBuf = p.lat >= cty.latMin - latBuf && p.lat <= cty.latMax + latBuf &&
+                            p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
+            const overCty = p.lat >= cty.latMin && p.lat <= cty.latMax &&
+                            p.lon >= cty.lonMin && p.lon <= cty.lonMax;
+            function flushPass(cp) {
+              // durationSec = time spent inside actual country bounds (not buffer)
+              const dur = cp.ctyLastT !== null ? cp.ctyLastT - cp.ctyStartT : 0;
+              allPasses.push({ day: cp.startDay, midT: (cp.startT + cp.lastT) / 2, durationSec: dur });
+            }
+            if (overBuf) {
+              if (!curP) {
+                curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400,
+                         ctyStartT: overCty ? p.t : null, ctyLastT: overCty ? p.t : null };
+              } else {
                 const dt = p.t / 86400 - curP.startDay;
                 if (dt > T / 86400 * 0.4) {
-                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: curP.lastT - curP.startT });
-                  curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400 };
-                } else { curP.lastT = p.t; }
+                  flushPass(curP);
+                  curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400,
+                           ctyStartT: overCty ? p.t : null, ctyLastT: overCty ? p.t : null };
+                } else {
+                  curP.lastT = p.t;
+                  if (overCty) {
+                    if (curP.ctyStartT === null) curP.ctyStartT = p.t;
+                    curP.ctyLastT = p.t;
+                  }
+                }
               }
             } else if (curP) {
-              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: curP.lastT - curP.startT });
+              flushPass(curP);
               curP = null;
             }
           }
-          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: curP.lastT - curP.startT });
+          if (curP) { const dur = curP.ctyLastT !== null ? curP.ctyLastT - curP.ctyStartT : 0; allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: dur }); }
 
           for (const bucket of passBuckets) {
             passCountByTf[bucket] = allPasses.filter(p =>
