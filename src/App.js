@@ -74,48 +74,54 @@ function constellationTrack(sat, numOrbits, ptsPerOrbit) {
 }
 
 /* Compute optimal RAAN so the very first pass crosses the anchor country.
-   For SSO (inc>90°): descending node crosses target on first half-orbit.
-   For prograde (inc<90°): ascending node crosses target. */
+   Derived from groundTrack(): lon = RAAN + atan2(cos(inc)·sin(u), cos(u)) - OMEGA_E·t
+   Solving for RAAN to hit targetLon at argument-of-latitude u:
+     RAAN = targetLon − argLonEci(u) + earthRotDeg                              */
 function computeOptimalRaan(sat, anchorCty) {
   const targetLon = (anchorCty.lonMin + anchorCty.lonMax) / 2;
   const targetLat = (anchorCty.latMin + anchorCty.latMax) / 2;
   const inc = sat.inclination;
   const T = orbPeriod(sat.altitude);
 
-  if (inc > 90) {
-    // SSO retrograde: satellite starts at ascending node (lat=0).
-    // Descends through targetLat at argument of latitude u = π - asin(sinLat/sinInc).
-    const sinR = Math.sin(Math.abs(targetLat) * DEG) / Math.sin(inc * DEG);
-    const uTgt = Math.PI - Math.asin(Math.min(1, Math.max(-1, sinR)));
-    // If target is in southern hemisphere, that's the natural descending leg.
-    // If target is northern hemisphere, use ascending leg: u = asin(sinR)
-    const u = targetLat >= 0
-      ? Math.asin(Math.min(1, Math.max(-1, sinR)))
-      : uTgt;
+  // Longitude the satellite has travelled east/west along its orbit by the time
+  // it reaches argument-of-latitude u (radians). Matches groundTrack() formula.
+  function argLonEciDeg(u) {
+    return Math.atan2(Math.cos(inc * DEG) * Math.sin(u), Math.cos(u)) / DEG;
+  }
+
+  // Given u (radians, [0,2π]), return the RAAN that places the satellite over
+  // targetLon at exactly that point in its orbit.
+  function raanForCrossing(u) {
     const tToTgt = (u / (2 * Math.PI)) * T;
     const earthRotDeg = OMEGA_E * tToTgt * RAD;
-    let raan = targetLon + earthRotDeg;
-    raan = ((raan % 360) + 360) % 360;
-    return raan;
+    return ((targetLon - argLonEciDeg(u) + earthRotDeg) % 360 + 360) % 360;
+  }
+
+  if (inc > 90) {
+    // SSO retrograde: lat = arcsin(sin(inc)·sin(u)), so sin(u) = sin(|targetLat|)/sin(inc)
+    const sinR = Math.sin(Math.abs(targetLat) * DEG) / Math.sin(inc * DEG);
+    const aR = Math.asin(Math.min(1, Math.max(-1, sinR)));
+    // Northern target → earliest crossing is ascending leg (u = aR, sin(u)>0 → +lat)
+    // Southern target → earliest crossing is just past descending node (u = π+aR, sin(u)<0 → -lat)
+    const u = targetLat >= 0 ? aR : Math.PI + aR;
+    return raanForCrossing(u);
   } else {
-    // Prograde: find both u crossings at targetLat, pick the one that arrives soonest
+    // Prograde: evaluate both orbit crossings at targetLat, pick the one that arrives soonest
     const sinU = Math.sin(targetLat * DEG) / Math.sin(Math.max(inc, 1) * DEG);
     if (Math.abs(sinU) > 1) {
       // Target latitude unreachable — fallback: ascending node points at target lon
       return ((targetLon % 360) + 360) % 360;
     }
     const asinU = Math.asin(sinU);
-    // Two crossings per orbit: ascending leg (u1) and descending leg (u2)
     const u1 = asinU < 0 ? asinU + 2 * Math.PI : asinU; // normalized to [0, 2π]
-    const u2 = Math.PI - asinU;                            // descending crossing
+    const u2 = Math.PI - asinU;                            // second crossing
     let bestRaan = ((targetLon % 360) + 360) % 360;
     let bestT = Infinity;
     for (const u of [u1, u2]) {
       const tToTgt = (u / (2 * Math.PI)) * T;
       if (tToTgt < bestT) {
         bestT = tToTgt;
-        const earthRotDeg = OMEGA_E * tToTgt * RAD;
-        bestRaan = ((targetLon + earthRotDeg) % 360 + 360) % 360;
+        bestRaan = raanForCrossing(u);
       }
     }
     return bestRaan;
