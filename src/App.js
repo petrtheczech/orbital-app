@@ -11,8 +11,9 @@ function nodalPrec(alt, inc, ecc = 0) {
   const a = R_E + alt, n = Math.sqrt(MU / (a * a * a)), p = a * (1 - ecc * ecc);
   return -1.5 * n * J2 * Math.pow(R_E / p, 2) * Math.cos(inc * DEG) * RAD * 86400;
 }
-function effSwathKm(alt, swHalf, offNadir) {
-  return 2 * alt * Math.tan(swHalf * DEG) + alt * Math.tan(offNadir * DEG);
+function effSwathKm(alt, swHalf) {
+  // swHalf is the sensor half-angle FOV; swath = 2 × alt × tan(halfAngle)
+  return 2 * alt * Math.tan(swHalf * DEG);
 }
 function groundTrack(sat, numOrbits, ptsPerOrbit = 300) {
   const { altitude, inclination, eccentricity: e = 0, raan = 0, argPerigee = 0 } = sat;
@@ -239,7 +240,7 @@ function simulateCoverage(sat, cty, tfDays) {
   const covered = new Uint8Array(cells);
   const T = orbPeriod(sat.altitude);
   const orbits = Math.ceil((86400 / T) * tfDays);
-  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10, sat.offNadir || 0);
+  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
   const swLat = (sw / (2 * Math.PI * R_E)) * 360;
   const maxPerDay = (sat.dataCapacity || 1e9) * (sat.count || 1);
   let dayUsed = 0, curDay = 0;
@@ -353,11 +354,10 @@ function computePasses(sat, cty, numDays, startT = 0) {
   const safePpo = nOrbits * ppo > 200000 ? Math.max(minPpoForSize, Math.round(200000 / nOrbits)) : ppo;
   const pts = constellationTrack(sat, nOrbits, safePpo);
 
-  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10, sat.offNadir || 0);
+  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
   const swDegLat = (sw / (2 * Math.PI * R_E)) * 360;
-  // Use a tight buffer: just enough for swath width, not huge multipliers
-  const latBuf = swDegLat / 2 + 0.5;
-  const lonBuf = swDegLat / 2 / Math.max(Math.cos(((cty.latMin + cty.latMax) / 2) * DEG), 0.1) + 0.5;
+  const latBuf = swDegLat / 2 + 0.8;
+  const lonBuf = 1.5;
 
   let passes = [];
   let cur = null;
@@ -434,7 +434,18 @@ function computePasses(sat, cty, numDays, startT = 0) {
   }
   const pct = (cov.reduce((s, v) => s + v, 0) / (gN * gN) * 100).toFixed(1);
   const passMidTimes = passes.map(pass => pass[Math.floor(pass.length / 2)].t);
-  return { passPolys, covPct: pct, swDegLat, passes, passMidTimes };
+  // Ground track length over the country for each pass (sum of segment distances)
+  const passLengthsKm = passes.map(pass => {
+    let len = 0;
+    for (let i = 1; i < pass.length; i++) {
+      const dlat = (pass[i].lat - pass[i-1].lat) * 111.32;
+      const midLat = (pass[i].lat + pass[i-1].lat) / 2;
+      const dlon = (pass[i].lon - pass[i-1].lon) * Math.cos(midLat * DEG) * 111.32;
+      len += Math.sqrt(dlat * dlat + dlon * dlon);
+    }
+    return len;
+  });
+  return { passPolys, covPct: pct, swDegLat, passes, passMidTimes, passLengthsKm };
 }
 
 // OSM tile compositing on a canvas for a real map background
@@ -527,7 +538,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
   const [sunlitOnly, setSunlitOnly] = useState(false);
   const tfDays = TRACK_TF_OPTS[tfIdx].d;
 
-  const { passPolys, covPct, passes, passMidTimes } = useMemo(
+  const { passPolys, covPct, passes, passMidTimes, passLengthsKm } = useMemo(
     () => computePasses(sat, country, tfDays, anchorOffset),
     [sat.altitude, sat.inclination, sat.eccentricity, sat.raan, sat.argPerigee,
      sat.swathAngle, sat.offNadir, country.id, tfDays, anchorOffset]
@@ -541,6 +552,14 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
   const visiblePasses = sunlitOnly
     ? passes.filter((_, i) => isInImagingWindow(passMidTimes[i], midLat, midLon))
     : passes;
+
+  // Sunlit covered area (always sunlit-only, regardless of toggle), capped at daily capacity
+  const swKm = effSwathKm(sat.altitude, sat.swathAngle || 10);
+  const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
+  const uncappedCovKm2 = sunlitIdxs.reduce((sum, i) => sum + swKm * (passLengthsKm[i] || 0), 0);
+  const dailyCap = sat.dataCapacity || 0;
+  const covKm2 = dailyCap > 0 ? Math.min(uncappedCovKm2, dailyCap * tfDays) : uncappedCovKm2;
+  const fmtKm2 = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(1)}k` : v.toFixed(0);
 
   const cty = country;
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
@@ -576,7 +595,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
   for (let lo = Math.ceil((vLonMin) / gStep) * gStep; lo <= vLonMax; lo += gStep) lonLines.push(lo);
 
   const T = orbPeriod(sat.altitude);
-  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10, sat.offNadir || 0);
+  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
   const gapKm = ((360 / (86400 / T)) * (2 * Math.PI * R_E / 360) * cosM).toFixed(0);
 
   return (
@@ -657,6 +676,14 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
           <div style={{ color: "rgba(200,220,240,0.6)", fontSize: 8, fontFamily: "'IBM Plex Mono',monospace", marginTop: 3, lineHeight: 1.4 }}>
             {sat.altitude}km · {sat.inclination}° · {sw.toFixed(0)}km swath · {visiblePasses.length}{sunlitOnly ? ' ☀' : ''} passes/{tfDays}d
           </div>
+          {covKm2 > 0 && (
+            <div style={{ marginTop: 4, fontSize: 9, fontFamily: "'IBM Plex Mono',monospace", color: "#64FFDA", fontWeight: 600 }}>
+              ☀ {fmtKm2(covKm2)} km² imaged / {fmtKm2(country.area)} km²
+              {dailyCap > 0 && uncappedCovKm2 > dailyCap * tfDays && (
+                <span style={{ color: "#FFB300", fontSize: 8, marginLeft: 4 }}>(cap {fmtKm2(dailyCap * tfDays)})</span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Orbital params */}
@@ -754,7 +781,7 @@ function MainMap({ sats, selCtys, countries, onCtClick, anim, showSw, showGr, an
     // Ground tracks
     sats.forEach(sat => {
       const track = constellationTrack(sat, 1, 400);
-      const sw = effSwathKm(sat.altitude, sat.swathAngle || 10, sat.offNadir || 0);
+      const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
       const swD = (sw / (2 * Math.PI * R_E)) * 360;
       if (showSw) { ctx.fillStyle = sat.color + "0a"; track.forEach(pt => { const x = lonX(pt.lon), y = latY(pt.lat), hh = (swD / 180) * MH / 2; ctx.fillRect(x - 1, y - hh, 2, hh * 2); }); }
       ctx.strokeStyle = sat.color; ctx.lineWidth = 1.5; ctx.shadowColor = sat.color; ctx.shadowBlur = 3; ctx.beginPath();
@@ -910,7 +937,7 @@ export default function App() {
 
           // ── First imaging time for any point in the AOI ──
           const T = orbPeriod(effectiveSat.altitude);
-          const sw = effSwathKm(effectiveSat.altitude, effectiveSat.swathAngle || 10, effectiveSat.offNadir || 0);
+          const sw = effSwathKm(effectiveSat.altitude, effectiveSat.swathAngle || 10);
           const swDegLat = (sw / (2 * Math.PI * R_E)) * 360;
           const nOrbits30 = Math.ceil((86400 / T) * Math.min(tf, 30));
           const latSpanCty = cty.latMax - cty.latMin;
@@ -923,11 +950,10 @@ export default function App() {
           // ── Count passes per timeframe bucket ──
           const passBuckets = [1, 3, 5, 7, 14, 30];
           const passCountByTf = {};
-          const latBuf = swDegLat / 2 + 0.5;
-          const cosMid = Math.max(Math.cos(((cty.latMin + cty.latMax) / 2) * DEG), 0.1);
-          const lonBuf = swDegLat / 2 / cosMid + 0.5;
+          const latBuf = swDegLat / 2 + 0.8;
+          const lonBuf = 1.5;
           
-          // Detect all passes (time-gap based), each stored as {day, midT}
+          // Detect all passes (time-gap based), each stored as {day, midT, durationSec}
           const allPasses = [];
           let curP = null;
           for (let pi = 0; pi < trackPts.length; pi++) {
@@ -939,16 +965,16 @@ export default function App() {
               else {
                 const dt = p.t / 86400 - curP.startDay;
                 if (dt > T / 86400 * 0.4) {
-                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2 });
+                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: curP.lastT - curP.startT });
                   curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400 };
                 } else { curP.lastT = p.t; }
               }
             } else if (curP) {
-              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2 });
+              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: curP.lastT - curP.startT });
               curP = null;
             }
           }
-          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2 });
+          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, durationSec: curP.lastT - curP.startT });
 
           for (const bucket of passBuckets) {
             passCountByTf[bucket] = allPasses.filter(p =>
@@ -963,6 +989,18 @@ export default function App() {
             sunlitPassCountByTf[bucket] = sunlitPasses.filter(p =>
               p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
             ).length;
+          }
+
+          // Covered area per timeframe (sunlit passes × swath × track length, capped at daily capacity)
+          const vGround = 2 * Math.PI * R_E / T; // km/s subsatellite ground speed
+          const coveredAreaSunlitByTf = {};
+          for (const bucket of passBuckets) {
+            const inBucket = sunlitPasses.filter(p =>
+              p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
+            );
+            const uncapped = inBucket.reduce((s, p) => s + sw * vGround * p.durationSec, 0);
+            const cap = (effectiveSat.dataCapacity || 0) * bucket;
+            coveredAreaSunlitByTf[bucket] = cap > 0 ? Math.min(uncapped, cap) : uncapped;
           }
 
           // Grid dimensions (shared by all-pass and sunlit analysis)
@@ -1077,6 +1115,7 @@ export default function App() {
             meanRevisit, worstRevisitDays,
             passCountByTf,
             sunlitPassCountByTf,
+            coveredAreaSunlitByTf,
             sunlitFirstImgBest,
             sunlitMeanRevisit,
           });
@@ -1215,7 +1254,7 @@ export default function App() {
                     {sat.gsd && <div><span style={{ color: "#2a5068" }}>GSD:</span> <span style={{ color: "#FFD740", fontWeight: 600 }}>{sat.gsd}</span></div>}
                     {sat.mass && <div><span style={{ color: "#2a5068" }}>Mass:</span> <span style={{ color: "#80b8d8" }}>{sat.mass}</span></div>}
                     <div><span style={{ color: "#2a5068" }}>Alt:</span> <span style={{ color: "#80b8d8" }}>{sat.altitude}km</span></div>
-                    <div><span style={{ color: "#2a5068" }}>Swath:</span> <span style={{ color: "#80b8d8" }}>{effSwathKm(sat.altitude, sat.swathAngle, sat.offNadir).toFixed(0)}km</span></div>
+                    <div><span style={{ color: "#2a5068" }}>Swath:</span> <span style={{ color: "#80b8d8" }}>{effSwathKm(sat.altitude, sat.swathAngle).toFixed(0)}km</span></div>
                     <div><span style={{ color: "#2a5068" }}>Off-nadir:</span> <span style={{ color: "#80b8d8" }}>{sat.offNadir}°</span></div>
                     <div><span style={{ color: "#2a5068" }}>Capacity:</span> <span style={{ color: "#80b8d8" }}>{fmt(sat.dataCapacity * cnt)} km²/d</span></div>
                   </div>
@@ -1379,14 +1418,25 @@ export default function App() {
           {/* Sat cards */}
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
             {sats.map(sat => {
-              const T = orbPeriod(sat.altitude), sw = effSwathKm(sat.altitude, sat.swathAngle, sat.offNadir);
+              const T = orbPeriod(sat.altitude), sw = effSwathKm(sat.altitude, sat.swathAngle);
               return (
                 <P key={sat.id} style={{ flex: "1 1 200px", maxWidth: 280, padding: "10px 12px", borderLeft: `3px solid ${sat.color}` }}>
                   <div style={{ fontWeight: 700, color: "#d8ecff", fontSize: 10, marginBottom: 6 }}>{sat.name}</div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px" }}>
-                    {[["Period", `${(T / 60).toFixed(1)} min`], ["Orbits/day", (86400 / T).toFixed(1)], ["Eff. Swath", `${sw.toFixed(0)} km`], ["Off-nadir", `${sat.offNadir}°`], ["Capacity", `${fmt(sat.dataCapacity)} km²/d`], ["Lifetime", `${sat.lifetime} yrs`]].map(([k, v]) => (
+                    {[["Period", `${(T / 60).toFixed(1)} min`], ["Orbits/day", (86400 / T).toFixed(1)], ["Eff. Swath", `${sw.toFixed(0)} km`], ["Off-nadir", `${sat.offNadir}°`], ["Lifetime", `${sat.lifetime} yrs`]].map(([k, v]) => (
                       <div key={k}><div style={{ fontSize: 7, color: "#2a4a60", letterSpacing: 1 }}>{k.toUpperCase()}</div><div style={{ fontSize: 10, color: "#90c8e0", fontWeight: 600 }}>{v}</div></div>
                     ))}
+                    <div>
+                      <div style={{ fontSize: 7, color: "#2a4a60", letterSpacing: 1 }}>CAPACITY</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 3, marginTop: 1 }}>
+                        <input
+                          type="number" min="0" value={sat.dataCapacity}
+                          onChange={e => setSats(prev => prev.map(s => s.id === sat.id ? { ...s, dataCapacity: +e.target.value || 0 } : s))}
+                          style={{ width: 58, background: "rgba(4,8,16,0.8)", border: "1px solid rgba(100,200,255,0.2)", color: "#90c8e0", padding: "1px 4px", borderRadius: 2, fontSize: 9, fontFamily: "inherit", fontWeight: 600 }}
+                        />
+                        <span style={{ fontSize: 7, color: "#2a4a60" }}>km²/d</span>
+                      </div>
+                    </div>
                   </div>
                 </P>
               );
@@ -1478,11 +1528,16 @@ export default function App() {
                           <td style={{ padding: "6px 6px", color: "#806030" }}>—</td>
                           <td style={{ padding: "6px 6px", color: "#FFB300" }}>{fmtD(r.sunlitMeanRevisit)}</td>
                           <td style={{ padding: "6px 6px", color: "#4a4a40" }}>—</td>
-                          {[1,3,5,7,14,30].map(b => (
-                            <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: b === 1 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (spc[b] || 0) === 0 ? "#3a4a40" : "#FFB300" }}>
-                              {spc[b] || 0}
-                            </td>
-                          ))}
+                          {[1,3,5,7,14,30].map(b => {
+                            const ca = (r.coveredAreaSunlitByTf || {})[b];
+                            const caStr = ca > 0 ? (ca >= 1e6 ? `${(ca/1e6).toFixed(1)}M` : ca >= 1e3 ? `${(ca/1e3).toFixed(1)}k` : ca.toFixed(0)) : null;
+                            return (
+                              <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: b === 1 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (spc[b] || 0) === 0 ? "#3a4a40" : "#FFB300" }}>
+                                {spc[b] || 0}
+                                {caStr && <div style={{ fontSize: 7, color: "#806040", fontWeight: 400, marginTop: 1 }}>{caStr} km²</div>}
+                              </td>
+                            );
+                          })}
                         </tr>
                       ];
                     })}
@@ -1673,7 +1728,7 @@ export default function App() {
                   <tbody>
                     {results.map((r, i) => {
                       const sat = sats.find(s => s.id === r.satId);
-                      const sw = sat ? effSwathKm(sat.altitude, sat.swathAngle, sat.offNadir) : 0;
+                      const sw = sat ? effSwathKm(sat.altitude, sat.swathAngle) : 0;
                       return (
                         <tr key={i} style={{ borderBottom: "1px solid rgba(70,140,200,0.05)" }}>
                           <td style={{ padding: "6px 7px", color: r.satColor, fontWeight: 600 }}>{r.satName}</td>
