@@ -964,7 +964,11 @@ export default function App() {
           const T = orbPeriod(effectiveSat.altitude);
           const sw = effSwathKm(effectiveSat.altitude, effectiveSat.swathAngle || 10);
           const swDegLat = (sw / (2 * Math.PI * R_E)) * 360;
-          const nOrbits30 = Math.ceil((86400 / T) * Math.min(tf, 30));
+          // Always simulate at least 30 days so sunlitPassCountByTf[30] and
+          // uncappedSunlitAreaByTf[30] reflect real 30-day values regardless of
+          // the selected analysis timeframe. Without this, choosing tf=7 would make
+          // the 30-day columns equal to the 7-day columns.
+          const nOrbits30 = Math.ceil((86400 / T) * Math.max(tf, 30));
           const latSpanCty = cty.latMax - cty.latMin;
           const fullLat = 2 * Math.min(effectiveSat.inclination, 180 - effectiveSat.inclination);
           const minPpo = Math.ceil((fullLat / Math.max(latSpanCty, 0.5)) * 4);
@@ -1068,8 +1072,12 @@ export default function App() {
           const gN = 15;
           const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
 
+          // Grid analysis respects the selected timeframe tf (not the full 30-day track)
+          const tfEndSec = (anchorOffsetDays + tf) * 86400;
+          const trackPtsTf = trackPts.filter(p => p.t <= tfEndSec);
+
           // Sunlit grid analysis
-          const sunlitPts = trackPts.filter(p => isInImagingWindow(p.t, ctyMidLat, ctyMidLon));
+          const sunlitPts = trackPtsTf.filter(p => isInImagingWindow(p.t, ctyMidLat, ctyMidLon));
           const sfirstVisit = new Float64Array(gN * gN).fill(Infinity);
           const slastVisit = new Float64Array(gN * gN).fill(-1);
           const srevisitSum = new Float64Array(gN * gN);
@@ -1111,7 +1119,7 @@ export default function App() {
           const revisitCount = new Uint16Array(gN * gN);
           const maxRevisit = new Float64Array(gN * gN);
 
-          for (const p of trackPts) {
+          for (const p of trackPtsTf) {
             const cosL = Math.max(Math.cos(p.lat * DEG), 0.05);
             const halfLon = swDegLat / 2 / cosL;
             const dayT = p.t / 86400;
