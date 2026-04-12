@@ -1058,6 +1058,14 @@ export default function App() {
           const avgSunlitPassLengthKm = sunlitIn30.length > 0
             ? sunlitIn30.reduce((s, p) => s + p.trackLengthKm, 0) / sunlitIn30.length
             : 0;
+
+          // Per-day sunlit coverage (uncapped) for computing max-single-day potential.
+          // dayIdx 0 = anchor day 0, bucketed by Math.floor(pass.day - anchorOffsetDays).
+          const sunlitCoveragePerDay = new Float64Array(30);
+          for (const p of sunlitIn30) {
+            const di = Math.floor(p.day - anchorOffsetDays);
+            if (di >= 0 && di < 30) sunlitCoveragePerDay[di] += sw * p.trackLengthKm;
+          }
           // Diagnostic: log TRACE over Rwanda to verify track length after clipping fix
           if (effectiveSat.id === 'trace' && cty.id === 'rw') {
             console.log('[TRACE/Rwanda] sunlit passes in 30d:', sunlitIn30.length,
@@ -1192,6 +1200,7 @@ export default function App() {
             satLifetime: effectiveSat.lifetime || 5,
             sunlitFirstImgBest,
             sunlitMeanRevisit,
+            sunlitCoveragePerDay: Array.from(sunlitCoveragePerDay),
           });
         });
       });
@@ -1707,6 +1716,13 @@ export default function App() {
                 const headroom = dailyCap > 0 ? dailyCap - totalUncappedDaily : null;
                 const imagerPerYear = effectiveDaily * 365.25;
                 const imageryLifetime = imagerPerYear * (satResults[0].satLifetime || 5);
+                // Max daily potential: highest single-day total across all countries combined
+                const dayTotals = new Float64Array(30);
+                for (const r of satResults) {
+                  const cpd = r.sunlitCoveragePerDay || [];
+                  for (let d = 0; d < 30; d++) dayTotals[d] += cpd[d] || 0;
+                }
+                const maxDailyPotential = Math.max(...dayTotals);
                 return (
                   <div key={sat.id} style={{ marginBottom: 14, padding: "12px 14px", background: "rgba(4,8,16,0.6)", borderRadius: "0 6px 6px 0", border: `1px solid rgba(70,140,200,0.1)`, borderLeft: `3px solid ${sat.color}` }}>
                     {/* Header */}
@@ -1724,9 +1740,10 @@ export default function App() {
                     </div>
 
                     {/* A: Daily demand vs capacity */}
-                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginBottom: 12 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6, marginBottom: 12 }}>
                       {[
-                        ["Daily Demand", `${fmt(totalUncappedDaily)} km²/d`, "#FFD740"],
+                        ["Avg Daily Demand", `${fmt(totalUncappedDaily)} km²/d`, "#FFD740"],
+                        ["Max Daily Potential", maxDailyPotential > 0 ? `${fmt(maxDailyPotential)} km²/d` : "—", "#FF9800"],
                         ["Daily Capacity", dailyCap > 0 ? `${fmt(dailyCap)} km²/d` : "—", "#64FFDA"],
                         ["Utilization", utilization !== null ? `${utilization.toFixed(0)}%` : "—",
                           utilization === null ? "#4a6880" : utilization >= 95 ? "#FF5252" : utilization >= 70 ? "#FFD740" : "#69FF47"],
@@ -1740,6 +1757,19 @@ export default function App() {
                           <div style={{ fontSize: 11, color: c, fontWeight: 700 }}>{v}</div>
                         </div>
                       ))}
+                    </div>
+                    {/* Actual output per year (capacity-capped) */}
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, padding: "8px 10px", background: "rgba(100,255,218,0.05)", border: "1px solid rgba(100,255,218,0.15)", borderRadius: 4 }}>
+                      <div>
+                        <div style={{ fontSize: 7, color: "#3a7060", letterSpacing: 1, marginBottom: 2 }}>ACTUAL OUTPUT / YR</div>
+                        <div style={{ fontSize: 16, color: "#64FFDA", fontWeight: 700 }}>{fmt(imagerPerYear)} km²</div>
+                      </div>
+                      <div style={{ fontSize: 8, color: "#2a5048", lineHeight: 1.5 }}>
+                        = min(avg demand, capacity) × 365<br />
+                        {dailyCap > 0 && isCapLimited
+                          ? `Capped at ${fmt(dailyCap)} km²/d capacity`
+                          : `Demand-limited at ${fmt(totalUncappedDaily)} km²/d`}
+                      </div>
                     </div>
 
                     {/* B: Per-country breakdown */}
@@ -1757,7 +1787,9 @@ export default function App() {
                           const grossPerPass = r.avgSunlitPassLengthKm * r.swKm;
                           const annualImagery = (r.sunlitPassCountByTf[30] || 0) * (365.25 / 30) * grossPerPass;
                           const dailyDemand = (r.uncappedSunlitAreaByTf[30] || 0) / 30;
+                          // Share derived from uncappedSunlitAreaByTf to match km²/yr column exactly
                           const share = totalUncappedDaily > 0 ? (dailyDemand / totalUncappedDaily * 100) : 0;
+                          const shareStr = share < 0.1 ? '<0.1' : share < 10 ? share.toFixed(1) : share.toFixed(0);
                           return (
                             <tr key={ri} style={{ borderBottom: "1px solid rgba(70,140,200,0.05)" }}>
                               <td style={{ padding: "5px 6px", color: "#80a8c0", fontWeight: 600 }}>{r.countryName}</td>
@@ -1770,7 +1802,7 @@ export default function App() {
                                   <div style={{ width: 36, height: 4, background: "rgba(70,140,200,0.1)", borderRadius: 2 }}>
                                     <div style={{ width: `${Math.min(share, 100)}%`, height: "100%", background: sat.color, borderRadius: 2, opacity: 0.7 }} />
                                   </div>
-                                  <span style={{ color: "#80c0d8", minWidth: 28, textAlign: "right" }}>{share.toFixed(0)}%</span>
+                                  <span style={{ color: "#80c0d8", minWidth: 32, textAlign: "right" }}>{shareStr}%</span>
                                 </div>
                               </td>
                             </tr>
@@ -1784,7 +1816,7 @@ export default function App() {
                       {[
                         ["Imagery / yr", `${fmt(imagerPerYear)} km²`, "#FFD740"],
                         ["Lifetime imagery", `${fmt(imageryLifetime)} km²`, "#64FFDA"],
-                        ["Max daily potential", `${fmt(totalUncappedDaily)} km²/d`, "#a0d0e8"],
+                        ["Peak day", maxDailyPotential > 0 ? `${fmt(maxDailyPotential)} km²` : "—", "#FF9800"],
                         ["Lifetime", `${satResults[0].satLifetime} yrs`, "#607080"],
                       ].map(([k, v, c]) => (
                         <div key={k}>
