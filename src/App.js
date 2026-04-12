@@ -1,4 +1,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import jsPDF from "jspdf";
+import html2canvas from "html2canvas";
+import { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, WidthType, AlignmentType, HeadingLevel } from "docx";
+import { saveAs } from "file-saver";
 
 /* ══════════════════════════════════════════════════════════════
    CONSTANTS & PHYSICS
@@ -14,6 +18,29 @@ function nodalPrec(alt, inc, ecc = 0) {
 function effSwathKm(alt, swHalf) {
   // swHalf is the sensor half-angle FOV; swath = 2 × alt × tan(halfAngle)
   return 2 * alt * Math.tan(swHalf * DEG);
+}
+
+/* Maximum straight-line (diagonal) distance across the country bounding box */
+function countryDiagonal(cty) {
+  const dLat = cty.latMax - cty.latMin;
+  const dLon = cty.lonMax - cty.lonMin;
+  const cosLat = Math.cos(((cty.latMin + cty.latMax) / 2) * DEG);
+  return Math.sqrt(Math.pow(dLat * 111.32, 2) + Math.pow(dLon * 111.32 * cosLat, 2));
+}
+
+/* Haversine track length over a list of {lat, lon} points, capped at country diagonal.
+   Uses ALL buffer-zone points in the detected pass — no strict-bounds clipping needed. */
+function passTrackLength(passPoints, cty) {
+  let totalKm = 0;
+  for (let i = 1; i < passPoints.length; i++) {
+    const dLatR = (passPoints[i].lat - passPoints[i - 1].lat) * DEG;
+    const dLonR = (passPoints[i].lon - passPoints[i - 1].lon) * DEG;
+    const a = Math.pow(Math.sin(dLatR / 2), 2) +
+              Math.cos(passPoints[i - 1].lat * DEG) * Math.cos(passPoints[i].lat * DEG) *
+              Math.pow(Math.sin(dLonR / 2), 2);
+    totalKm += R_E * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+  return Math.min(totalKm, countryDiagonal(cty));
 }
 function groundTrack(sat, numOrbits, ptsPerOrbit = 300) {
   const { altitude, inclination, eccentricity: e = 0, raan = 0, argPerigee = 0 } = sat;
@@ -453,23 +480,8 @@ function computePasses(sat, cty, numDays, startT = 0) {
   }
   const pct = (cov.reduce((s, v) => s + v, 0) / (gN * gN) * 100).toFixed(1);
   const passMidTimes = passes.map(pass => pass[Math.floor(pass.length / 2)].t);
-  // Ground track length clipped to actual country bounds (no buffer) for each pass.
-  // Buffer is used only for pass detection; coverage measurement uses strict bounds.
-  const passLengthsKm = passes.map(pass => {
-    let len = 0;
-    for (let i = 1; i < pass.length; i++) {
-      const p0 = pass[i - 1], p1 = pass[i];
-      // Only count a segment if both endpoints are inside the actual country bounds
-      const p0in = p0.lat >= cty.latMin && p0.lat <= cty.latMax && p0.lon >= cty.lonMin && p0.lon <= cty.lonMax;
-      const p1in = p1.lat >= cty.latMin && p1.lat <= cty.latMax && p1.lon >= cty.lonMin && p1.lon <= cty.lonMax;
-      if (!p0in || !p1in) continue;
-      const dlat = (p1.lat - p0.lat) * 111.32;
-      const midLat = (p1.lat + p0.lat) / 2;
-      const dlon = (p1.lon - p0.lon) * Math.cos(midLat * DEG) * 111.32;
-      len += Math.sqrt(dlat * dlat + dlon * dlon);
-    }
-    return len;
-  });
+  // Use all buffer-zone pass points with haversine, capped at country diagonal.
+  const passLengthsKm = passes.map(pass => passTrackLength(pass, cty));
   return { passPolys, covPct: pct, swDegLat, passes, passMidTimes, passLengthsKm };
 }
 
@@ -878,6 +890,9 @@ export default function App() {
   const [tf, setTf] = useState(16);
   const [results, setResults] = useState(null);
   const [running, setRunning] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const mainRef = useRef(null);
   const [showAdd, setShowAdd] = useState(false);
   const [commercialRate, setCommercialRate] = useState(15); // $/km²
   const [form, setForm] = useState({
@@ -983,45 +998,36 @@ export default function App() {
           const lonBuf = 1.5;
           
           // Detect all passes (time-gap based).
-          // trackLengthKm is accumulated only for segments where both consecutive points
-          // are inside the strict country bounds (no buffer). This way a pass that just
-          // clips the corner still gets a non-zero length if ≥2 consecutive inside points.
+          // Collect ALL buffer-zone points per pass, then call passTrackLength() which
+          // uses haversine over those points and caps at the country diagonal.
           const allPasses = [];
           let curP = null;
           for (let pi = 0; pi < trackPts.length; pi++) {
             const p = trackPts[pi];
             const overBuf = p.lat >= cty.latMin - latBuf && p.lat <= cty.latMax + latBuf &&
                             p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
-            const overCty = p.lat >= cty.latMin && p.lat <= cty.latMax &&
-                            p.lon >= cty.lonMin && p.lon <= cty.lonMax;
             if (overBuf) {
               if (!curP) {
-                curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400,
-                         trackLengthKm: 0, prevPt: p, prevCty: overCty };
+                curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400, points: [p] };
               } else {
                 const dt = p.t / 86400 - curP.startDay;
                 if (dt > T / 86400 * 0.4) {
-                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, trackLengthKm: curP.trackLengthKm });
-                  curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400,
-                           trackLengthKm: 0, prevPt: p, prevCty: overCty };
+                  allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2,
+                                   trackLengthKm: passTrackLength(curP.points, cty) });
+                  curP = { startT: p.t, lastT: p.t, startDay: p.t / 86400, points: [p] };
                 } else {
                   curP.lastT = p.t;
-                  if (overCty && curP.prevCty) {
-                    const dlat = (p.lat - curP.prevPt.lat) * 111.32;
-                    const mLat = (p.lat + curP.prevPt.lat) / 2;
-                    const dlon = (p.lon - curP.prevPt.lon) * Math.cos(mLat * DEG) * 111.32;
-                    curP.trackLengthKm += Math.sqrt(dlat * dlat + dlon * dlon);
-                  }
-                  curP.prevPt = p;
-                  curP.prevCty = overCty;
+                  curP.points.push(p);
                 }
               }
             } else if (curP) {
-              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, trackLengthKm: curP.trackLengthKm });
+              allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2,
+                               trackLengthKm: passTrackLength(curP.points, cty) });
               curP = null;
             }
           }
-          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2, trackLengthKm: curP.trackLengthKm });
+          if (curP) allPasses.push({ day: curP.startDay, midT: (curP.startT + curP.lastT) / 2,
+                                     trackLengthKm: passTrackLength(curP.points, cty) });
 
           for (const bucket of passBuckets) {
             passCountByTf[bucket] = allPasses.filter(p =>
@@ -1039,6 +1045,29 @@ export default function App() {
               p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + bucket
             ).length;
           }
+
+          // Pass-day-based revisit metrics (from detected pass list, not grid cells)
+          const allPassDays30 = allPasses
+            .filter(p => p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + 30)
+            .map(p => p.day - anchorOffsetDays).sort((a, b) => a - b);
+          const firstAllPassDay = allPassDays30.length > 0 ? allPassDays30[0] : null;
+          const meanRevisitDays = allPassDays30.length > 1
+            ? (allPassDays30[allPassDays30.length - 1] - allPassDays30[0]) / (allPassDays30.length - 1)
+            : null;
+          const maxGapDays = allPassDays30.length > 1
+            ? Math.max(...allPassDays30.slice(1).map((d, i) => d - allPassDays30[i]))
+            : null;
+
+          const sunlitPassDays30 = sunlitPasses
+            .filter(p => p.day >= anchorOffsetDays && p.day <= anchorOffsetDays + 30)
+            .map(p => p.day - anchorOffsetDays).sort((a, b) => a - b);
+          const firstSunlitPassDay = sunlitPassDays30.length > 0 ? sunlitPassDays30[0] : null;
+          const sunlitMeanRevisitDays = sunlitPassDays30.length > 1
+            ? (sunlitPassDays30[sunlitPassDays30.length - 1] - sunlitPassDays30[0]) / (sunlitPassDays30.length - 1)
+            : null;
+          const sunlitMaxGapDays = sunlitPassDays30.length > 1
+            ? Math.max(...sunlitPassDays30.slice(1).map((d, i) => d - sunlitPassDays30[i]))
+            : null;
 
           // Covered area per timeframe (sunlit passes × swath × track length, capped at daily capacity)
           const vGround = 2 * Math.PI * R_E / T; // km/s subsatellite ground speed
@@ -1112,20 +1141,15 @@ export default function App() {
               }
             }
           }
-          let sMinFirst = Infinity, sSumMeanRev = 0, sRevCells = 0;
+          let sMinFirst = Infinity;
           for (let i = 0; i < gN * gN; i++) {
             if (sfirstVisit[i] < sMinFirst) sMinFirst = sfirstVisit[i];
-            if (srevisitCount[i] > 0) { sSumMeanRev += srevisitSum[i] / srevisitCount[i]; sRevCells++; }
           }
-          const sunlitFirstImgBest = sMinFirst === Infinity ? null : sMinFirst;
-          const sunlitMeanRevisit = sRevCells > 0 ? sSumMeanRev / sRevCells : null;
+          const sunlitFirstImgBest = sMinFirst === Infinity ? null : sMinFirst - anchorOffsetDays;
           
-          // Grid-based first-visit and revisit (all passes)
+          // Grid-based first-visit (for 100% coverage day and first-image times)
           const firstVisit = new Float64Array(gN * gN).fill(Infinity);
           const lastVisit = new Float64Array(gN * gN).fill(-1);
-          const revisitSum = new Float64Array(gN * gN);
-          const revisitCount = new Uint16Array(gN * gN);
-          const maxRevisit = new Float64Array(gN * gN);
 
           for (const p of trackPtsTf) {
             const cosL = Math.max(Math.cos(p.lat * DEG), 0.05);
@@ -1141,39 +1165,21 @@ export default function App() {
                 if (Math.abs(gLon - p.lon) > halfLon) continue;
                 const idx = gi * gN + gj;
                 if (firstVisit[idx] === Infinity) firstVisit[idx] = dayT;
-                if (lastVisit[idx] >= 0) {
-                  const gap = dayT - lastVisit[idx];
-                  if (gap > 0.02) { // ignore sub-orbit gaps
-                    revisitSum[idx] += gap;
-                    revisitCount[idx]++;
-                    if (gap > maxRevisit[idx]) maxRevisit[idx] = gap;
-                  }
-                }
                 lastVisit[idx] = dayT;
               }
             }
           }
 
-          let minFirstVisit = Infinity, maxFirstVisit = 0, sumFirstVisit = 0, visitedCells = 0;
-          let sumMeanRevisit = 0, worstRevisit = 0, revisitCells = 0;
+          let minFirstVisit = Infinity, maxFirstVisit = 0, visitedCells = 0;
           for (let i = 0; i < gN * gN; i++) {
             if (firstVisit[i] < Infinity) {
               if (firstVisit[i] < minFirstVisit) minFirstVisit = firstVisit[i];
               if (firstVisit[i] > maxFirstVisit) maxFirstVisit = firstVisit[i];
-              sumFirstVisit += firstVisit[i];
               visitedCells++;
             }
-            if (revisitCount[i] > 0) {
-              sumMeanRevisit += revisitSum[i] / revisitCount[i];
-              if (maxRevisit[i] > worstRevisit) worstRevisit = maxRevisit[i];
-              revisitCells++;
-            }
           }
-          const firstImgBest = minFirstVisit === Infinity ? null : minFirstVisit;
-          const firstImgWorst = maxFirstVisit === 0 ? null : maxFirstVisit;
-          const firstImgMean = visitedCells > 0 ? sumFirstVisit / visitedCells : null;
-          const meanRevisit = revisitCells > 0 ? sumMeanRevisit / revisitCells : null;
-          const worstRevisitDays = worstRevisit > 0 ? worstRevisit : null;
+          const firstImgBest = minFirstVisit === Infinity ? null : minFirstVisit - anchorOffsetDays;
+          const firstImgWorst = maxFirstVisit === 0 ? null : maxFirstVisit - anchorOffsetDays;
 
           res.push({
             satId: sat.id, satName: sat.name, satColor: sat.color, countryId: cty.id, countryName: cty.name,
@@ -1188,8 +1194,9 @@ export default function App() {
             isAnchor: cty.id === anchorCty,
             effectiveRaan: effectiveSat.raan,
             originalRaan: sat.raan,
-            firstImgBest, firstImgWorst, firstImgMean,
-            meanRevisit, worstRevisitDays,
+            firstImgBest, firstImgWorst,
+            firstAllPassDay, meanRevisitDays, maxGapDays,
+            firstSunlitPassDay, sunlitMeanRevisitDays, sunlitMaxGapDays,
             passCountByTf,
             sunlitPassCountByTf,
             coveredAreaSunlitByTf,
@@ -1198,8 +1205,6 @@ export default function App() {
             swKm: sw,
             satDataCapacity: effectiveSat.dataCapacity || 0,
             satLifetime: effectiveSat.lifetime || 5,
-            sunlitFirstImgBest,
-            sunlitMeanRevisit,
             sunlitCoveragePerDay: Array.from(sunlitCoveragePerDay),
           });
         });
@@ -1207,6 +1212,110 @@ export default function App() {
       setResults(res); setRunning(false); setTab("results");
     }, 60);
   };
+
+  const exportPDF = useCallback(async () => {
+    setExporting(true); setExportOpen(false);
+    try {
+      const pdf = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4" });
+      const pageW = pdf.internal.pageSize.getWidth();
+      const pageH = pdf.internal.pageSize.getHeight();
+      const margin = 10;
+      const contentW = pageW - margin * 2;
+
+      // Title page
+      pdf.setFillColor(2, 6, 16);
+      pdf.rect(0, 0, pageW, pageH, "F");
+      pdf.setTextColor(100, 255, 218);
+      pdf.setFontSize(18);
+      pdf.text("ORBITAL COVERAGE ANALYSIS", pageW / 2, 40, { align: "center" });
+      pdf.setTextColor(160, 208, 232);
+      pdf.setFontSize(10);
+      pdf.text(`Generated: ${new Date().toISOString().slice(0, 10)}`, pageW / 2, 52, { align: "center" });
+      pdf.setTextColor(42, 90, 120);
+      pdf.setFontSize(8);
+      pdf.text(`Satellites: ${sats.map(s => s.name).join(", ")}`, pageW / 2, 62, { align: "center" });
+
+      // Capture each named section
+      const sections = mainRef.current ? Array.from(mainRef.current.querySelectorAll("[data-section]")) : [];
+      for (const section of sections) {
+        const canvas = await html2canvas(section, { backgroundColor: "#020610", scale: 1.5, useCORS: true, logging: false });
+        const imgData = canvas.toDataURL("image/jpeg", 0.85);
+        const ratio = canvas.height / canvas.width;
+        const imgW = contentW;
+        const imgH = Math.min(imgW * ratio, pageH - margin * 2);
+        pdf.addPage();
+        pdf.setFillColor(2, 6, 16);
+        pdf.rect(0, 0, pageW, pageH, "F");
+        pdf.addImage(imgData, "JPEG", margin, margin, imgW, imgH);
+      }
+      pdf.save("orbital-coverage-analysis.pdf");
+    } catch (e) { console.error("PDF export error:", e); }
+    setExporting(false);
+  }, [sats, mainRef]);
+
+  const exportWord = useCallback(async () => {
+    setExporting(true); setExportOpen(false);
+    try {
+      const fmtD = (d) => {
+        if (d === null || d === undefined) return "—";
+        if (d < 1/24) return `${(d * 24 * 60).toFixed(0)} min`;
+        if (d < 1) return `${(d * 24).toFixed(1)} hrs`;
+        return `${d.toFixed(1)} days`;
+      };
+
+      const headerRow = new TableRow({
+        children: ["Satellite → Country", "Mode", "First Pass", "Mean Revisit", "Max Gap", "100% Coverage", "1d", "3d", "5d", "7d", "14d", "30d"].map(h =>
+          new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: h, bold: true, size: 16 })], alignment: AlignmentType.CENTER })] })
+        )
+      });
+
+      const dataRows = (results || []).flatMap((r) => {
+        const pc = r.passCountByTf || {};
+        const allRow = new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: `${r.satName} → ${r.countryName}`, bold: true, size: 16 })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ALL", size: 16 })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.firstAllPassDay), size: 16 })], alignment: AlignmentType.CENTER })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.meanRevisitDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.maxGapDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`, size: 16 })], alignment: AlignmentType.CENTER })] }),
+            ...[1,3,5,7,14,30].map(b => new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String(pc[b] || 0), size: 16 })], alignment: AlignmentType.CENTER })] })),
+          ]
+        });
+        const optRow = new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "", size: 16 })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "☀ OPT", size: 16 })] })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.firstSunlitPassDay), size: 16 })], alignment: AlignmentType.CENTER })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.sunlitMeanRevisitDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.sunlitMaxGapDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
+            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "—", size: 16 })], alignment: AlignmentType.CENTER })] }),
+            ...[1,3,5,7,14,30].map(b => new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String((r.sunlitPassCountByTf || {})[b] || 0), size: 16 })], alignment: AlignmentType.CENTER })] })),
+          ]
+        });
+        return [allRow, optRow];
+      });
+
+      const doc = new Document({
+        sections: [{
+          children: [
+            new Paragraph({ text: "Orbital Coverage Analysis", heading: HeadingLevel.HEADING_1 }),
+            new Paragraph({ text: `Generated: ${new Date().toISOString().slice(0, 10)}`, spacing: { after: 200 } }),
+            new Paragraph({ text: `Satellites: ${sats.map(s => s.name).join(", ")}`, spacing: { after: 400 } }),
+            new Paragraph({ text: "Revisit Analysis", heading: HeadingLevel.HEADING_2 }),
+            new Table({
+              width: { size: 100, type: WidthType.PERCENTAGE },
+              rows: [headerRow, ...dataRows],
+            }),
+          ]
+        }]
+      });
+
+      const blob = await Packer.toBlob(doc);
+      saveAs(blob, "orbital-coverage-analysis.docx");
+    } catch (e) { console.error("Word export error:", e); }
+    setExporting(false);
+  }, [results, sats, tf]);
 
   const tfOpts = [{ l: "1 Day", v: 1 }, { l: "3 Days", v: 3 }, { l: "7 Days", v: 7 }, { l: "16 Days", v: 16 }, { l: "30 Days", v: 30 }, { l: "90 Days", v: 90 }, { l: "1 Year", v: 365 }];
   const selCtyObjs = COUNTRIES.filter(c => selCtys.includes(c.id));
@@ -1250,6 +1359,23 @@ export default function App() {
           <Btn sm on style={{ background: "rgba(100,255,218,0.1)", borderColor: "rgba(100,255,218,0.3)", color: "#64FFDA" }} onClick={runAnalysis}>
             {running ? "⟳ RUNNING..." : "▶ RUN ANALYSIS"}
           </Btn>
+          {results && (
+            <div style={{ position: "relative" }}>
+              <Btn sm on={exportOpen} onClick={() => setExportOpen(o => !o)} style={{ background: "rgba(255,215,0,0.08)", borderColor: "rgba(255,215,0,0.25)", color: "#FFD740" }}>
+                {exporting ? "⟳ EXPORTING..." : "⬇ EXPORT ▾"}
+              </Btn>
+              {exportOpen && (
+                <div style={{ position: "absolute", top: "100%", right: 0, marginTop: 4, background: "#0a1628", border: "1px solid rgba(255,215,0,0.2)", borderRadius: 4, zIndex: 100, minWidth: 130 }}>
+                  <button onClick={exportPDF} style={{ display: "block", width: "100%", padding: "8px 12px", background: "transparent", border: "none", color: "#FFD740", fontSize: 10, fontFamily: "inherit", textAlign: "left", cursor: "pointer", letterSpacing: 0.5 }}>
+                    ⎙ Export PDF
+                  </button>
+                  <button onClick={exportWord} style={{ display: "block", width: "100%", padding: "8px 12px", background: "transparent", border: "none", color: "#FFD740", fontSize: 10, fontFamily: "inherit", textAlign: "left", cursor: "pointer", letterSpacing: 0.5, borderTop: "1px solid rgba(255,215,0,0.1)" }}>
+                    ⊞ Export Word
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1495,7 +1621,7 @@ export default function App() {
         </div>
 
         {/* ── MAIN ── */}
-        <div style={{ flex: 1, overflowY: "auto", padding: "14px 18px" }}>
+        <div ref={mainRef} style={{ flex: 1, overflowY: "auto", padding: "14px 18px" }}>
           <MainMap sats={(() => { const a = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null; return a ? sats.map(s => satWithAnchorRaan(s, a)) : sats; })()} selCtys={selCtys} countries={COUNTRIES} onCtClick={toggleCty} anim={anim} showSw={showSw} showGr={showGr} anchorId={anchorCty} />
           <div style={{ display: "flex", gap: 10, marginTop: 6, marginBottom: 14 }}>
             {[["Swath", showSw, setShowSw], ["Grid", showGr, setShowGr]].map(([l, v, s]) => (
@@ -1556,7 +1682,7 @@ export default function App() {
               ) : null;
             })()}
             {/* Timeline */}
-            <P style={{ padding: 14, marginBottom: 14 }}>
+            <P data-section="timeline" style={{ padding: 14, marginBottom: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <Lbl>COVERAGE TIMELINE</Lbl>
                 <div style={{ display: "flex", gap: 3 }}>{tfOpts.map(o => <Btn key={o.v} sm on={tf === o.v} onClick={() => setTf(o.v)}>{o.l}</Btn>)}</div>
@@ -1567,18 +1693,38 @@ export default function App() {
               </div>
             </P>
 
-            {/* ── FIRST IMAGING & REVISIT ANALYSIS ── */}
-            <P style={{ padding: 14, marginBottom: 14 }}>
-              <Lbl>FIRST IMAGING & REVISIT ANALYSIS</Lbl>
+            {/* ── REVISIT ANALYSIS ── */}
+            <P data-section="revisit" style={{ padding: 14, marginBottom: 14 }}>
+              <Lbl>REVISIT ANALYSIS</Lbl>
               <div style={{ fontSize: 9, color: "#3a6080", marginBottom: 10, lineHeight: 1.5 }}>
-                How quickly can each satellite image any given point within each AOI? Includes pass counts across multiple timeframes.
+                Pass-based revisit metrics over 30 days. Mean Revisit and Max Gap computed directly from the detected pass list. 100% Coverage from grid simulation.
               </div>
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
                   <thead>
                     <tr style={{ borderBottom: "2px solid rgba(70,140,200,0.15)" }}>
-                      {["Satellite → Country", "First Image\n(best)", "First Image\n(worst)", "Mean\nRevisit", "100%\nCoverage", "1d", "3d", "5d", "7d", "14d", "30d"].map((h, i) => (
-                        <th key={i} style={{ textAlign: i >= 5 ? "center" : "left", padding: "7px 6px", color: i >= 5 ? "#4a8898" : "#2a5a78", fontWeight: 600, fontSize: 8, letterSpacing: 0.8, whiteSpace: "pre-line", verticalAlign: "bottom", borderLeft: i === 5 ? "1px solid rgba(70,140,200,0.12)" : "none" }}>{i >= 5 ? h + "\npasses" : h}</th>
+                      {[
+                        { label: "Satellite → Country", center: false },
+                        { label: "Mode", center: false },
+                        { label: "First\nPass", center: true },
+                        { label: "Mean\nRevisit", center: true },
+                        { label: "Max\nGap", center: true },
+                        { label: "100%\nCoverage", center: true },
+                        { label: "1d\npasses", center: true, sep: true },
+                        { label: "3d\npasses", center: true },
+                        { label: "5d\npasses", center: true },
+                        { label: "7d\npasses", center: true },
+                        { label: "14d\npasses", center: true },
+                        { label: "30d\npasses", center: true },
+                      ].map((h, i) => (
+                        <th key={i} style={{
+                          textAlign: h.center ? "center" : "left",
+                          padding: "7px 6px",
+                          color: h.sep ? "#4a8898" : i < 6 ? "#2a5a78" : "#4a8898",
+                          fontWeight: 600, fontSize: 8, letterSpacing: 0.8,
+                          whiteSpace: "pre-line", verticalAlign: "bottom",
+                          borderLeft: h.sep ? "1px solid rgba(70,140,200,0.12)" : "none"
+                        }}>{h.label}</th>
                       ))}
                     </tr>
                   </thead>
@@ -1599,32 +1745,30 @@ export default function App() {
                             <span style={{ color: r.satColor }}>{r.satName}</span>
                             <span style={{ color: "#2a4a60" }}> → </span>
                             <span style={{ color: "#80a8c0" }}>{r.countryName}</span>
-                            <div style={{ fontSize: 8, color: "#2a5068", marginTop: 1 }}>ALL</div>
                           </td>
-                          <td style={{ padding: "6px 6px", color: "#64FFDA", fontWeight: 700 }}>{fmtD(r.firstImgBest)}</td>
-                          <td style={{ padding: "6px 6px", color: "#FFD740" }}>{fmtD(r.firstImgWorst)}</td>
-                          <td style={{ padding: "6px 6px", color: "#a0d0e8" }}>{fmtD(r.meanRevisit)}</td>
-                          <td style={{ padding: "6px 6px", fontWeight: 700, color: r.fullCovDay ? "#64FFDA" : "#FF8A80" }}>{r.fullCovDay ? fmtD(r.fullCovDay) : `>D${tf}`}</td>
-                          {[1,3,5,7,14,30].map(b => (
-                            <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: b === 1 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (pc[b] || 0) === 0 ? "#3a4a58" : (pc[b] || 0) >= 5 ? "#64FFDA" : "#a0d0e8" }}>
+                          <td style={{ padding: "6px 6px", fontSize: 8, color: "#4a7890", fontWeight: 600, whiteSpace: "nowrap" }}>ALL</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#64FFDA", fontWeight: 700 }}>{fmtD(r.firstAllPassDay)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#a0d0e8" }}>{fmtD(r.meanRevisitDays)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFD740" }}>{fmtD(r.maxGapDays)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: r.fullCovDay !== null ? "#64FFDA" : "#FF8A80" }}>{r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`}</td>
+                          {[1,3,5,7,14,30].map((b, bi) => (
+                            <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: bi === 0 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (pc[b] || 0) === 0 ? "#3a4a58" : (pc[b] || 0) >= 5 ? "#64FFDA" : "#a0d0e8" }}>
                               {pc[b] || 0}
                             </td>
                           ))}
                         </tr>,
                         <tr key={`${i}-opt`} style={{ borderBottom: "1px solid rgba(70,140,200,0.08)", background: "rgba(255,179,0,0.03)" }}>
-                          <td style={{ padding: "6px 6px", fontWeight: 600, verticalAlign: "middle" }}>
-                            <span style={{ fontSize: 9, color: "#FFB300", fontWeight: 700 }}>☀ OPT</span>
-                            <div style={{ fontSize: 8, color: "#806020", marginTop: 1 }}>Sunlit passes only</div>
-                          </td>
-                          <td style={{ padding: "6px 6px", color: "#FFB300", fontWeight: 700 }}>{fmtD(r.sunlitFirstImgBest)}</td>
-                          <td style={{ padding: "6px 6px", color: "#806030" }}>—</td>
-                          <td style={{ padding: "6px 6px", color: "#FFB300" }}>{fmtD(r.sunlitMeanRevisit)}</td>
-                          <td style={{ padding: "6px 6px", color: "#4a4a40" }}>—</td>
-                          {[1,3,5,7,14,30].map(b => {
+                          <td style={{ padding: "6px 6px", verticalAlign: "middle", color: "#3a4050", fontSize: 8 }}></td>
+                          <td style={{ padding: "6px 6px", fontSize: 9, color: "#FFB300", fontWeight: 700, whiteSpace: "nowrap" }}>☀ OPT</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>{fmtD(r.firstSunlitPassDay)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300" }}>{fmtD(r.sunlitMeanRevisitDays)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#cc8800" }}>{fmtD(r.sunlitMaxGapDays)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a4a40" }}>—</td>
+                          {[1,3,5,7,14,30].map((b, bi) => {
                             const ca = (r.coveredAreaSunlitByTf || {})[b];
                             const caStr = ca > 0 ? (ca >= 1e6 ? `${(ca/1e6).toFixed(1)}M` : ca >= 1e3 ? `${(ca/1e3).toFixed(1)}k` : ca.toFixed(0)) : null;
                             return (
-                              <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: b === 1 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (spc[b] || 0) === 0 ? "#3a4a40" : "#FFB300" }}>
+                              <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: bi === 0 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (spc[b] || 0) === 0 ? "#3a4a40" : "#FFB300" }}>
                                 {spc[b] || 0}
                                 {caStr && <div style={{ fontSize: 7, color: "#806040", fontWeight: 400, marginTop: 1 }}>{caStr} km²</div>}
                               </td>
@@ -1645,10 +1789,9 @@ export default function App() {
                     {sats.map(sat => {
                       const satResults = results.filter(r => r.satId === sat.id);
                       if (satResults.length === 0) return null;
-                      const bestFirst = Math.min(...satResults.map(r => r.firstImgBest).filter(v => v !== null));
-                      const worstFirst = Math.max(...satResults.map(r => r.firstImgWorst || 0));
-                      const avgMeanRevisit = satResults.reduce((s, r) => s + (r.meanRevisit || 0), 0) / satResults.length;
-                      const worstRevisitAll = Math.max(...satResults.map(r => r.worstRevisitDays || 0));
+                      const bestFirst = Math.min(...satResults.map(r => r.firstAllPassDay).filter(v => v !== null && v !== undefined));
+                      const avgMeanRevisit = satResults.reduce((s, r) => s + (r.meanRevisitDays || 0), 0) / satResults.length;
+                      const worstMaxGap = Math.max(...satResults.map(r => r.maxGapDays || 0).filter(isFinite));
                       const allCovered = satResults.every(r => r.fullCovDay !== null);
                       const maxCovDay = Math.max(...satResults.map(r => r.fullCovDay || Infinity));
                       const fmtD = (d) => {
@@ -1661,10 +1804,9 @@ export default function App() {
                         <P key={sat.id} style={{ padding: "8px 10px", borderLeft: `3px solid ${sat.color}` }}>
                           <div style={{ fontWeight: 700, color: "#d8ecff", fontSize: 10, marginBottom: 6 }}>{sat.name}</div>
                           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px 10px", fontSize: 9 }}>
-                            <div><span style={{ color: "#2a5068" }}>First img (best):</span> <span style={{ color: "#64FFDA", fontWeight: 700 }}>{fmtD(bestFirst)}</span></div>
-                            <div><span style={{ color: "#2a5068" }}>First img (worst):</span> <span style={{ color: "#FFD740" }}>{fmtD(worstFirst)}</span></div>
-                            <div><span style={{ color: "#2a5068" }}>Avg revisit:</span> <span style={{ color: "#a0d0e8" }}>{fmtD(avgMeanRevisit)}</span></div>
-                            <div><span style={{ color: "#2a5068" }}>Worst revisit:</span> <span style={{ color: "#FF8A80" }}>{fmtD(worstRevisitAll)}</span></div>
+                            <div><span style={{ color: "#2a5068" }}>First pass (best):</span> <span style={{ color: "#64FFDA", fontWeight: 700 }}>{fmtD(bestFirst)}</span></div>
+                            <div><span style={{ color: "#2a5068" }}>Avg mean revisit:</span> <span style={{ color: "#a0d0e8" }}>{fmtD(avgMeanRevisit)}</span></div>
+                            <div><span style={{ color: "#2a5068" }}>Worst max gap:</span> <span style={{ color: "#FFD740" }}>{fmtD(worstMaxGap)}</span></div>
                             <div style={{ gridColumn: "1/-1" }}><span style={{ color: "#2a5068" }}>All {satResults.length} AOIs covered:</span> <span style={{ color: allCovered ? "#64FFDA" : "#FF8A80", fontWeight: 700 }}>{allCovered ? `Yes (last at day ${maxCovDay.toFixed(1)})` : "No"}</span></div>
                           </div>
                         </P>
@@ -1676,7 +1818,7 @@ export default function App() {
             </P>
 
             {/* ── COUNTRY GROUND TRACK MAPS ── */}
-            <P style={{ padding: 14, marginBottom: 14 }}>
+            <P data-section="groundtrack" style={{ padding: 14, marginBottom: 14 }}>
               <Lbl>COUNTRY GROUND TRACK ANALYSIS</Lbl>
               <div style={{ fontSize: 9, color: "#3a6080", marginBottom: 10, lineHeight: 1.5 }}>
                 Zoomed maps showing full ground track lines over each target country. Use the timeframe buttons below each map to see track buildup over 1 day → 30 days. Green cells = covered area.
@@ -1700,7 +1842,7 @@ export default function App() {
             </P>
 
             {/* ── SATELLITE UTILIZATION & ECONOMICS ── */}
-            <P style={{ padding: 14, marginBottom: 14 }}>
+            <P data-section="economics" style={{ padding: 14, marginBottom: 14 }}>
               <Lbl>SATELLITE UTILIZATION &amp; ECONOMICS</Lbl>
               <div style={{ fontSize: 9, color: "#3a6080", marginBottom: 14, lineHeight: 1.5 }}>
                 Per-satellite capacity analysis across all selected AOIs. Daily demand = total sunlit ground coverage the satellite could image across every country combined.
@@ -1867,7 +2009,7 @@ export default function App() {
             </div>
 
             {/* ── COMMERCIAL IMAGERY VALUE ── */}
-            <P style={{ padding: 14, marginBottom: 14 }}>
+            <P data-section="commercial" style={{ padding: 14, marginBottom: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
                 <Lbl style={{ marginBottom: 0 }}>COMMERCIAL IMAGERY VALUE</Lbl>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
