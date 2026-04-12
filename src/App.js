@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import jsPDF from "jspdf";
 import html2canvas from "html2canvas";
-import { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, WidthType, AlignmentType, HeadingLevel } from "docx";
+import { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, ImageRun, WidthType, AlignmentType, HeadingLevel } from "docx";
 import { saveAs } from "file-saver";
 
 /* ══════════════════════════════════════════════════════════════
@@ -100,59 +100,47 @@ function constellationTrack(sat, numOrbits, ptsPerOrbit) {
   return allPts;
 }
 
-/* Compute optimal RAAN so the very first pass crosses the anchor country.
-   Derived from groundTrack(): lon = RAAN + atan2(cos(inc)·sin(u), cos(u)) - OMEGA_E·t
-   Solving for RAAN to hit targetLon at argument-of-latitude u:
-     RAAN = targetLon − argLonEci(u) + earthRotDeg                              */
+/* Compute optimal RAAN so the earliest SUNLIT pass crosses the anchor country.
+   Searches 360 candidate RAAN values (1° step), runs a 5-day ground track for each,
+   and picks the RAAN whose first sunlit pass over the anchor happens soonest.
+   Fallback: if no sunlit pass is found in 5 days, uses longitude-based alignment. */
 function computeOptimalRaan(sat, anchorCty) {
   const targetLon = (anchorCty.lonMin + anchorCty.lonMax) / 2;
   const targetLat = (anchorCty.latMin + anchorCty.latMax) / 2;
-  const inc = sat.inclination;
   const T = orbPeriod(sat.altitude);
+  const swDeg = effSwathKm(sat.altitude, sat.swathAngle || 10) / (2 * Math.PI * R_E) * 360;
+  const latBuf = swDeg / 2 + 0.8, lonBuf = 1.5;
 
-  // Longitude the satellite has travelled east/west along its orbit by the time
-  // it reaches argument-of-latitude u (radians). Matches groundTrack() formula.
-  function argLonEciDeg(u) {
-    return Math.atan2(Math.cos(inc * DEG) * Math.sin(u), Math.cos(u)) / DEG;
-  }
+  let bestRaan = 0, bestDay = Infinity;
 
-  // Given u (radians, [0,2π]), return the RAAN that places the satellite over
-  // targetLon at exactly that point in its orbit.
-  function raanForCrossing(u) {
-    const tToTgt = (u / (2 * Math.PI)) * T;
-    const earthRotDeg = OMEGA_E * tToTgt * RAD;
-    return ((targetLon - argLonEciDeg(u) + earthRotDeg) % 360 + 360) % 360;
-  }
+  for (let testRaan = 0; testRaan < 360; testRaan += 1) {
+    const testSat = { ...sat, raan: testRaan, eccentricity: sat.eccentricity || 0, count: 1 };
+    const nOrbits5 = Math.ceil(86400 / T * 5);
+    const pts = groundTrack(testSat, nOrbits5, 500);
 
-  if (inc > 90) {
-    // SSO retrograde: lat = arcsin(sin(inc)·sin(u)), so sin(u) = sin(|targetLat|)/sin(inc)
-    const sinR = Math.sin(Math.abs(targetLat) * DEG) / Math.sin(inc * DEG);
-    const aR = Math.asin(Math.min(1, Math.max(-1, sinR)));
-    // Northern target → earliest crossing is ascending leg (u = aR, sin(u)>0 → +lat)
-    // Southern target → earliest crossing is just past descending node (u = π+aR, sin(u)<0 → -lat)
-    const u = targetLat >= 0 ? aR : Math.PI + aR;
-    return raanForCrossing(u);
-  } else {
-    // Prograde: evaluate both orbit crossings at targetLat, pick the one that arrives soonest
-    const sinU = Math.sin(targetLat * DEG) / Math.sin(Math.max(inc, 1) * DEG);
-    if (Math.abs(sinU) > 1) {
-      // Target latitude unreachable — fallback: ascending node points at target lon
-      return ((targetLon % 360) + 360) % 360;
-    }
-    const asinU = Math.asin(sinU);
-    const u1 = asinU < 0 ? asinU + 2 * Math.PI : asinU; // normalized to [0, 2π]
-    const u2 = Math.PI - asinU;                            // second crossing
-    let bestRaan = ((targetLon % 360) + 360) % 360;
-    let bestT = Infinity;
-    for (const u of [u1, u2]) {
-      const tToTgt = (u / (2 * Math.PI)) * T;
-      if (tToTgt < bestT) {
-        bestT = tToTgt;
-        bestRaan = raanForCrossing(u);
+    for (const p of pts) {
+      const over = p.lat >= anchorCty.latMin - latBuf && p.lat <= anchorCty.latMax + latBuf &&
+                   p.lon >= anchorCty.lonMin - lonBuf && p.lon <= anchorCty.lonMax + lonBuf;
+      if (over && isInImagingWindow(p.t, targetLat, targetLon)) {
+        const day = p.t / 86400;
+        if (day < bestDay) { bestDay = day; bestRaan = testRaan; }
+        break; // first sunlit hit for this RAAN; move to next candidate
       }
     }
-    return bestRaan;
   }
+
+  // Fallback: no sunlit pass found — align by longitude geometry
+  if (bestDay === Infinity) {
+    const pts = groundTrack({ ...sat, raan: 0, eccentricity: sat.eccentricity || 0, count: 1 }, 1, 2000);
+    let best = 0, bestErr = 999;
+    for (const p of pts) {
+      const err = Math.abs(p.lat - targetLat);
+      if (err < 3 && err < bestErr) { bestErr = err; best = targetLon - p.lon; }
+    }
+    return ((best % 360) + 360) % 360;
+  }
+
+  return bestRaan;
 }
 
 /* Create a copy of a satellite with RAAN optimized for an anchor country */
@@ -483,6 +471,79 @@ function computePasses(sat, cty, numDays, startT = 0) {
   // Use all buffer-zone pass points with haversine, capped at country diagonal.
   const passLengthsKm = passes.map(pass => passTrackLength(pass, cty));
   return { passPolys, covPct: pct, swDegLat, passes, passMidTimes, passLengthsKm };
+}
+
+/* Render a ground-track map to a JPEG data URL (no React, no tile loading).
+   Used by the Word/PDF export to generate map images programmatically. */
+function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, svgW = 480, svgH = 340) {
+  const { passPolys, passes, passMidTimes } = computePasses(sat, cty, tfDays, anchorOffset);
+  const midLat = (cty.latMin + cty.latMax) / 2;
+  const midLon = (cty.lonMin + cty.lonMax) / 2;
+
+  const visiblePassPolys = sunlitOnly
+    ? passPolys.filter((_, i) => isInImagingWindow(passMidTimes[i], midLat, midLon))
+    : passPolys;
+
+  const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
+  const margin = Math.max(dLat, dLon) * 0.3;
+  const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
+  const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
+  const vdLon = vLonMax - vLonMin;
+
+  const latToMerc = lat => Math.log(Math.tan((45 + lat / 2) * DEG));
+  const mercMin = latToMerc(vLatMin), mercMax = latToMerc(vLatMax);
+  const mercSpan = mercMax - mercMin;
+  const tX = lon => ((lon - vLonMin) / vdLon) * svgW;
+  const tY = lat => ((mercMax - latToMerc(Math.max(-85, Math.min(85, lat)))) / mercSpan) * svgH;
+
+  const passColor = sunlitOnly ? "#FFB300" : "#1E6EDC";
+  const lineColor = sunlitOnly ? "#FFD740" : "#64FFDA";
+
+  const parts = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}">`,
+    `<rect width="${svgW}" height="${svgH}" fill="#0d1a28"/>`,
+    // Country fill
+    `<rect x="${tX(cty.lonMin).toFixed(1)}" y="${tY(cty.latMax).toFixed(1)}" width="${(tX(cty.lonMax)-tX(cty.lonMin)).toFixed(1)}" height="${(tY(cty.latMin)-tY(cty.latMax)).toFixed(1)}" fill="#1c3020" stroke="rgba(80,180,80,0.5)" stroke-width="1"/>`,
+  ];
+
+  for (const poly of visiblePassPolys) {
+    const pts = [...poly.left, ...[...poly.right].reverse()];
+    const d = pts.map((p, i) => `${i===0?'M':'L'}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(' ') + ' Z';
+    parts.push(`<path d="${d}" fill="${passColor}" opacity="0.35"/>`);
+  }
+  for (const poly of visiblePassPolys) {
+    if (poly.center.length < 2) continue;
+    const d = poly.center.map((p, i) => `${i===0?'M':'L'}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(' ');
+    parts.push(`<path d="${d}" fill="none" stroke="${lineColor}" stroke-width="1.2" opacity="0.85"/>`);
+  }
+
+  const label = `${cty.name} · ${tfDays}d · ${sunlitOnly ? 'Sunlit' : 'All'} · ${visiblePassPolys.length} passes`;
+  parts.push(`<rect x="0" y="${svgH-18}" width="${svgW}" height="18" fill="rgba(0,0,0,0.55)"/>`);
+  parts.push(`<text x="6" y="${svgH-5}" font-size="9" fill="rgba(200,230,255,0.85)" font-family="monospace">${label}</text>`);
+  parts.push(`</svg>`);
+
+  return new Promise(resolve => {
+    const img = new window.Image();
+    const blob = new Blob([parts.join('')], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = svgW; canvas.height = svgH;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    img.src = url;
+  });
+}
+
+function dataUrlToUint8Array(dataUrl) {
+  const b64 = dataUrl.split(',')[1];
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
 }
 
 // OSM tile compositing on a canvas for a real map background
@@ -893,6 +954,7 @@ export default function App() {
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
   const mainRef = useRef(null);
+  const selCtyObjs = COUNTRIES.filter(c => selCtys.includes(c.id));
   const [showAdd, setShowAdd] = useState(false);
   const [commercialRate, setCommercialRate] = useState(15); // $/km²
   const [form, setForm] = useState({
@@ -1262,51 +1324,144 @@ export default function App() {
         if (d < 1) return `${(d * 24).toFixed(1)} hrs`;
         return `${d.toFixed(1)} days`;
       };
+      const fmtN = (n) => {
+        if (n >= 1e9) return (n/1e9).toFixed(1)+"B";
+        if (n >= 1e6) return (n/1e6).toFixed(1)+"M";
+        if (n >= 1e3) return (n/1e3).toFixed(1)+"k";
+        return n.toFixed(0);
+      };
+      const fmtM = (n) => {
+        if (n >= 1e9) return "$"+(n/1e9).toFixed(2)+"B";
+        if (n >= 1e6) return "$"+(n/1e6).toFixed(2)+"M";
+        if (n >= 1e3) return "$"+(n/1e3).toFixed(1)+"k";
+        return "$"+n.toFixed(0);
+      };
 
-      const headerRow = new TableRow({
-        children: ["Satellite → Country", "Mode", "First Pass", "Mean Revisit", "Max Gap", "100% Coverage", "1d", "3d", "5d", "7d", "14d", "30d"].map(h =>
-          new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: h, bold: true, size: 16 })], alignment: AlignmentType.CENTER })] })
-        )
+      const mkCell = (text, bold = false, center = false) =>
+        new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String(text), bold, size: 16 })], alignment: center ? AlignmentType.CENTER : AlignmentType.LEFT })] });
+      const mkHdr = (cols) => new TableRow({ children: cols.map(h => mkCell(h, true, true)) });
+
+      // ── REVISIT ANALYSIS TABLE ──
+      const revisitHdr = mkHdr(["Satellite → Country", "Mode", "First Pass", "Mean Revisit", "Max Gap", "100% Coverage", "1d", "3d", "5d", "7d", "14d", "30d"]);
+      const revisitRows = (results || []).flatMap(r => {
+        const pc = r.passCountByTf || {}, spc = r.sunlitPassCountByTf || {};
+        return [
+          new TableRow({ children: [
+            mkCell(`${r.satName} → ${r.countryName}`, true),
+            mkCell("ALL"),
+            mkCell(fmtD(r.firstAllPassDay), false, true),
+            mkCell(fmtD(r.meanRevisitDays), false, true),
+            mkCell(fmtD(r.maxGapDays), false, true),
+            mkCell(r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`, false, true),
+            ...[1,3,5,7,14,30].map(b => mkCell(String(pc[b]||0), false, true)),
+          ]}),
+          new TableRow({ children: [
+            mkCell(""),
+            mkCell("Sunlit OPT"),
+            mkCell(fmtD(r.firstSunlitPassDay), false, true),
+            mkCell(fmtD(r.sunlitMeanRevisitDays), false, true),
+            mkCell(fmtD(r.sunlitMaxGapDays), false, true),
+            mkCell("—", false, true),
+            ...[1,3,5,7,14,30].map(b => mkCell(String(spc[b]||0), false, true)),
+          ]}),
+        ];
       });
 
-      const dataRows = (results || []).flatMap((r) => {
-        const pc = r.passCountByTf || {};
-        const allRow = new TableRow({
-          children: [
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: `${r.satName} → ${r.countryName}`, bold: true, size: 16 })] })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "ALL", size: 16 })] })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.firstAllPassDay), size: 16 })], alignment: AlignmentType.CENTER })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.meanRevisitDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.maxGapDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`, size: 16 })], alignment: AlignmentType.CENTER })] }),
-            ...[1,3,5,7,14,30].map(b => new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String(pc[b] || 0), size: 16 })], alignment: AlignmentType.CENTER })] })),
-          ]
+      // ── UTILIZATION TABLE ──
+      const utilHdr = mkHdr(["Satellite", "Country", "Passes/30d", "Avg Track", "km²/pass", "km²/yr", "Demand Share"]);
+      const utilRows = sats.flatMap(sat => {
+        const satResults = (results || []).filter(r => r.satId === sat.id);
+        const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30), 0);
+        return satResults.map(r => {
+          const grossPerPass = r.avgSunlitPassLengthKm * r.swKm;
+          const annualImagery = (r.sunlitPassCountByTf[30]||0) * (365.25/30) * grossPerPass;
+          const dailyDemand = (r.uncappedSunlitAreaByTf[30]||0)/30;
+          const share = totalUncappedDaily > 0 ? (dailyDemand/totalUncappedDaily*100) : 0;
+          return new TableRow({ children: [
+            mkCell(sat.name, true),
+            mkCell(r.countryName),
+            mkCell(String(r.sunlitPassCountByTf[30]||0), false, true),
+            mkCell(`${r.avgSunlitPassLengthKm.toFixed(0)} km`, false, true),
+            mkCell(`${fmtN(grossPerPass)} km²`, false, true),
+            mkCell(`${fmtN(annualImagery)} km²`, false, true),
+            mkCell(`${share.toFixed(1)}%`, false, true),
+          ]});
         });
-        const optRow = new TableRow({
-          children: [
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "", size: 16 })] })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "☀ OPT", size: 16 })] })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.firstSunlitPassDay), size: 16 })], alignment: AlignmentType.CENTER })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.sunlitMeanRevisitDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: fmtD(r.sunlitMaxGapDays), size: 16 })], alignment: AlignmentType.CENTER })] }),
-            new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: "—", size: 16 })], alignment: AlignmentType.CENTER })] }),
-            ...[1,3,5,7,14,30].map(b => new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String((r.sunlitPassCountByTf || {})[b] || 0), size: 16 })], alignment: AlignmentType.CENTER })] })),
-          ]
-        });
-        return [allRow, optRow];
       });
+
+      // ── COMMERCIAL VALUE TABLE ──
+      const commHdr = mkHdr(["Satellite", "Country", "Passes/30d", "km²/yr", "Value/yr", "Value/lifetime"]);
+      const commRows = sats.flatMap(sat => {
+        const satResults = (results || []).filter(r => r.satId === sat.id);
+        const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30), 0);
+        const dailyCap = satResults[0]?.satDataCapacity || 0;
+        const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
+        const imgPerYear = effectiveDaily * 365.25;
+        return satResults.map(r => {
+          const passesPerYear = (r.sunlitPassCountByTf[30]||0) * (365.25/30);
+          const annualKm2 = passesPerYear * r.avgSunlitPassLengthKm * r.swKm;
+          const annualValue = annualKm2 * commercialRate;
+          const lifetimeValue = annualValue * (r.satLifetime||5);
+          return new TableRow({ children: [
+            mkCell(sat.name, true),
+            mkCell(r.countryName),
+            mkCell(String(r.sunlitPassCountByTf[30]||0), false, true),
+            mkCell(`${fmtN(annualKm2)} km²`, false, true),
+            mkCell(fmtM(annualValue), false, true),
+            mkCell(fmtM(lifetimeValue), false, true),
+          ]});
+        });
+      });
+
+      // ── GROUND TRACK MAP IMAGES ──
+      // 6 timeframes × 2 modes = 12 images per sat × country
+      const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
+      const mapChildren = [];
+      for (const sat of sats) {
+        const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+        const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
+        for (const cty of selCtyObjs) {
+          mapChildren.push(new Paragraph({ text: `${sat.name} → ${cty.name}`, heading: HeadingLevel.HEADING_3 }));
+          const grid = [];
+          for (const { l, d } of TRACK_TF_OPTS) {
+            for (const sunlit of [false, true]) {
+              const dataUrl = await renderTrackMapToDataURL(effSat, cty, anchorOffset, d, sunlit, 480, 340);
+              if (!dataUrl) continue;
+              const imgData = dataUrlToUint8Array(dataUrl);
+              grid.push(new Paragraph({
+                children: [
+                  new TextRun({ text: `${l} · ${sunlit ? 'Sunlit' : 'All passes'}  `, size: 14 }),
+                  new ImageRun({ data: imgData, transformation: { width: 480, height: 340 }, type: "jpg" }),
+                ],
+                spacing: { after: 120 },
+              }));
+            }
+          }
+          mapChildren.push(...grid);
+        }
+      }
 
       const doc = new Document({
         sections: [{
+          properties: { page: { size: { orientation: "landscape", width: 15840, height: 12240 } } },
           children: [
             new Paragraph({ text: "Orbital Coverage Analysis", heading: HeadingLevel.HEADING_1 }),
-            new Paragraph({ text: `Generated: ${new Date().toISOString().slice(0, 10)}`, spacing: { after: 200 } }),
-            new Paragraph({ text: `Satellites: ${sats.map(s => s.name).join(", ")}`, spacing: { after: 400 } }),
+            new Paragraph({ children: [new TextRun({ text: `Generated: ${new Date().toISOString().slice(0, 10)}  |  Satellites: ${sats.map(s => s.name).join(", ")}  |  Rate: $${commercialRate}/km²`, size: 18 })], spacing: { after: 400 } }),
+
             new Paragraph({ text: "Revisit Analysis", heading: HeadingLevel.HEADING_2 }),
-            new Table({
-              width: { size: 100, type: WidthType.PERCENTAGE },
-              rows: [headerRow, ...dataRows],
-            }),
+            new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: [revisitHdr, ...revisitRows] }),
+            new Paragraph({ text: "", spacing: { after: 400 } }),
+
+            new Paragraph({ text: "Satellite Utilization", heading: HeadingLevel.HEADING_2 }),
+            new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: [utilHdr, ...utilRows] }),
+            new Paragraph({ text: "", spacing: { after: 400 } }),
+
+            new Paragraph({ text: "Commercial Imagery Value", heading: HeadingLevel.HEADING_2 }),
+            new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: [commHdr, ...commRows] }),
+            new Paragraph({ text: "", spacing: { after: 400 } }),
+
+            new Paragraph({ text: "Ground Track Maps", heading: HeadingLevel.HEADING_2 }),
+            ...mapChildren,
           ]
         }]
       });
@@ -1315,10 +1470,9 @@ export default function App() {
       saveAs(blob, "orbital-coverage-analysis.docx");
     } catch (e) { console.error("Word export error:", e); }
     setExporting(false);
-  }, [results, sats, tf]);
+  }, [results, sats, tf, commercialRate, anchorCty, anchorFirstPassTimes, selCtyObjs]);
 
   const tfOpts = [{ l: "1 Day", v: 1 }, { l: "3 Days", v: 3 }, { l: "7 Days", v: 7 }, { l: "16 Days", v: 16 }, { l: "30 Days", v: 30 }, { l: "90 Days", v: 90 }, { l: "1 Year", v: 365 }];
-  const selCtyObjs = COUNTRIES.filter(c => selCtys.includes(c.id));
 
   const fmt = (n) => {
     if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
