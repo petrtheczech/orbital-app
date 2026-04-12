@@ -260,8 +260,8 @@ function simulateCoverage(sat, cty, tfDays) {
   const _ls = cty.latMax - cty.latMin;
   const _fl = 2 * Math.min(sat.inclination, 180 - sat.inclination);
   const _mp = Math.ceil((_fl / Math.max(_ls, 0.5)) * 4);
-  const _pp = Math.max(_mp, 40);
-  const _sp = orbits * _pp > 200000 ? Math.max(_mp, Math.round(200000 / orbits)) : _pp;
+  const _pp = Math.max(_mp, 500);
+  const _sp = orbits * _pp > 500000 ? Math.max(500, Math.round(500000 / orbits)) : _pp;
   const track = constellationTrack(sat, orbits, _sp);
   const timeline = [];
   let lastPct = -1;
@@ -362,9 +362,9 @@ function computePasses(sat, cty, numDays, startT = 0) {
   const latSpan = cty.latMax - cty.latMin;
   const fullLatTraverse = 2 * Math.min(sat.inclination, 180 - sat.inclination);
   const minPpoForSize = Math.ceil((fullLatTraverse / Math.max(latSpan, 0.5)) * 4);
-  const ppo = Math.max(minPpoForSize, 40);
-  // Cap total points at 200k for performance
-  const safePpo = nOrbits * ppo > 200000 ? Math.max(minPpoForSize, Math.round(200000 / nOrbits)) : ppo;
+  const ppo = Math.max(minPpoForSize, 500);
+  // Cap total points at 500k for performance
+  const safePpo = nOrbits * ppo > 500000 ? Math.max(500, Math.round(500000 / nOrbits)) : ppo;
   const pts = constellationTrack(sat, nOrbits, safePpo);
 
   const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
@@ -956,8 +956,8 @@ export default function App() {
           const latSpanCty = cty.latMax - cty.latMin;
           const fullLat = 2 * Math.min(effectiveSat.inclination, 180 - effectiveSat.inclination);
           const minPpo = Math.ceil((fullLat / Math.max(latSpanCty, 0.5)) * 4);
-          const ppo = Math.max(minPpo, 40);
-          const safePpo = nOrbits30 * ppo > 200000 ? Math.max(minPpo, Math.round(200000 / nOrbits30)) : ppo;
+          const ppo = Math.max(minPpo, 500);
+          const safePpo = nOrbits30 * ppo > 500000 ? Math.max(500, Math.round(500000 / nOrbits30)) : ppo;
           const trackPts = constellationTrack(effectiveSat, nOrbits30, safePpo);
 
           // ── Count passes per timeframe bucket ──
