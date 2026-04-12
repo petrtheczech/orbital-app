@@ -1054,6 +1054,15 @@ export default function App() {
           const avgSunlitPassLengthKm = sunlitIn30.length > 0
             ? sunlitIn30.reduce((s, p) => s + p.trackLengthKm, 0) / sunlitIn30.length
             : 0;
+          // Diagnostic: log TRACE over Rwanda to verify track length after clipping fix
+          if (effectiveSat.id === 'trace' && cty.id === 'rw') {
+            console.log('[TRACE/Rwanda] sunlit passes in 30d:', sunlitIn30.length,
+              '| avg track km:', avgSunlitPassLengthKm.toFixed(1),
+              '| swath km:', sw.toFixed(1),
+              '| km²/pass:', (avgSunlitPassLengthKm * sw).toFixed(0),
+              '| uncapped daily demand km²/d:', ((uncappedSunlitAreaByTf[30] || 0) / 30).toFixed(1),
+              '| trackLengths per pass:', sunlitIn30.map(p => p.trackLengthKm.toFixed(0)).join(', '));
+          }
 
           // Grid dimensions (shared by all-pass and sunlit analysis)
           const gN = 15;
