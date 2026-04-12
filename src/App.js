@@ -873,9 +873,17 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
           }} />
         )}
 
-        {/* SVG overlay */}
+        {/* SVG overlay — viewport is FIXED to country bounds, tracks clip at viewBox edge */}
         <svg width={svgW} height={svgH} viewBox={`0 0 ${svgW} ${svgH}`}
-          style={{ borderRadius: 4, position: "relative", zIndex: 1 }}>
+          style={{ borderRadius: 4, position: "relative", zIndex: 1 }}
+          overflow="hidden">
+
+          {/* Explicit clip region — ensures swath polygons never expand layout */}
+          <defs>
+            <clipPath id={`vp-${cty.id}`}>
+              <rect x="0" y="0" width={svgW} height={svgH} />
+            </clipPath>
+          </defs>
 
           {/* Fallback background (hidden when map loads) */}
           {!mapImg && <>
@@ -900,24 +908,24 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
             </g>
           ))}
 
-          {/* Country border fill (semi-transparent when map present) */}
+          {/* Country border fill */}
           <polygon points={bdrPath} fill={mapImg ? "rgba(120,175,100,0.15)" : "rgba(120,175,100,0.45)"} stroke="#2a6020" strokeWidth="2.5" strokeDasharray="8,4" />
 
-          {/* Swath bands — perpendicular to heading */}
-          {visiblePassPolys.map((poly, pi) => {
-            if (poly.left.length < 2) return null;
-            const lPts = poly.left.map(p => `${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`);
-            const rPts = [...poly.right].reverse().map(p => `${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`);
-            return <polygon key={`sw${pi}`} points={[...lPts, ...rPts].join(" ")}
-              fill="rgba(30,100,220,0.18)" stroke="rgba(30,100,220,0.05)" strokeWidth="0.3" />;
-          })}
-
-          {/* Track center lines */}
-          {visiblePassPolys.map((poly, pi) => {
-            if (poly.center.length < 2) return null;
-            const d = poly.center.map((p, i) => `${i === 0 ? "M" : "L"}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(" ");
-            return <path key={`tk${pi}`} d={d} fill="none" stroke="rgba(15,70,200,0.8)" strokeWidth="1.5" />;
-          })}
+          {/* Swath bands and track lines — clipped explicitly to viewport */}
+          <g clipPath={`url(#vp-${cty.id})`}>
+            {visiblePassPolys.map((poly, pi) => {
+              if (poly.left.length < 2) return null;
+              const lPts = poly.left.map(p => `${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`);
+              const rPts = [...poly.right].reverse().map(p => `${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`);
+              return <polygon key={`sw${pi}`} points={[...lPts, ...rPts].join(" ")}
+                fill="rgba(30,100,220,0.18)" stroke="rgba(30,100,220,0.05)" strokeWidth="0.3" />;
+            })}
+            {visiblePassPolys.map((poly, pi) => {
+              if (poly.center.length < 2) return null;
+              const d = poly.center.map((p, i) => `${i === 0 ? "M" : "L"}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(" ");
+              return <path key={`tk${pi}`} d={d} fill="none" stroke="rgba(15,70,200,0.8)" strokeWidth="1.5" />;
+            })}
+          </g>
 
           {/* Country border top */}
           <polygon points={bdrPath} fill="none" stroke="#1a5018" strokeWidth="2.5" />
