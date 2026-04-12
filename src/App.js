@@ -502,69 +502,200 @@ function computePasses(sat, cty, numDays, startT = 0) {
   return { passPolys, covPct: pct, swDegLat, passes, passMidTimes, passLengthsKm };
 }
 
-/* Render a ground-track map to a JPEG data URL (no React, no tile loading).
-   Used by the Word/PDF export to generate map images programmatically. */
-function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, svgW = 480, svgH = 340) {
-  const { passPolys, passes, passMidTimes } = computePasses(sat, cty, tfDays, anchorOffset);
+/* Render a ground-track map to a JPEG data URL with OSM tile background.
+   Replicates the full CountryTrackMap appearance: tiles → country border → swath
+   bands → track lines → info badges. Uses crossOrigin="anonymous" so OSM tiles
+   (which serve Access-Control-Allow-Origin: *) can be drawn to a readable canvas. */
+async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, W = 600, H = 480) {
+  const { passPolys, passes, passMidTimes, passLengthsKm } = computePasses(sat, cty, tfDays, anchorOffset);
   const midLat = (cty.latMin + cty.latMax) / 2;
   const midLon = (cty.lonMin + cty.lonMax) / 2;
-
   const visiblePassPolys = sunlitOnly
     ? passPolys.filter((_, i) => isInImagingWindow(passMidTimes[i], midLat, midLon))
     : passPolys;
 
+  // Viewport & Mercator projection (identical to CountryTrackMap)
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
   const margin = Math.max(dLat, dLon) * 0.3;
   const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
   const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
   const vdLon = vLonMax - vLonMin;
-
   const latToMerc = lat => Math.log(Math.tan((45 + lat / 2) * DEG));
   const mercMin = latToMerc(vLatMin), mercMax = latToMerc(vLatMax);
   const mercSpan = mercMax - mercMin;
-  const tX = lon => ((lon - vLonMin) / vdLon) * svgW;
-  const tY = lat => ((mercMax - latToMerc(Math.max(-85, Math.min(85, lat)))) / mercSpan) * svgH;
+  const tX = lon => ((lon - vLonMin) / vdLon) * W;
+  const tY = lat => ((mercMax - latToMerc(Math.max(-85, Math.min(85, lat)))) / mercSpan) * H;
 
-  const passColor = sunlitOnly ? "#FFB300" : "#1E6EDC";
-  const lineColor = sunlitOnly ? "#FFD740" : "#64FFDA";
+  // ── OSM tile loading (crossOrigin="anonymous" so canvas stays readable) ──
+  const maxSpan = Math.max(vLatMax - vLatMin, (vLonMax - vLonMin) * Math.cos(midLat * DEG));
+  const zoom = Math.max(1, Math.min(12, Math.round(Math.log2(360 / maxSpan)) + 1));
+  const n = Math.pow(2, zoom);
+  const tileXMin = Math.floor(((vLonMin + 180) / 360) * n);
+  const tileXMax = Math.floor(((vLonMax + 180) / 360) * n);
+  const tileYMin = Math.floor((1 - latToMerc(vLatMax) / Math.PI) / 2 * n);
+  const tileYMax = Math.floor((1 - latToMerc(vLatMin) / Math.PI) / 2 * n);
+  const tW = (tileXMax - tileXMin + 1) * 256, tH = (tileYMax - tileYMin + 1) * 256;
 
-  const parts = [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" viewBox="0 0 ${svgW} ${svgH}">`,
-    `<rect width="${svgW}" height="${svgH}" fill="#0d1a28"/>`,
-    // Country fill
-    `<rect x="${tX(cty.lonMin).toFixed(1)}" y="${tY(cty.latMax).toFixed(1)}" width="${(tX(cty.lonMax)-tX(cty.lonMin)).toFixed(1)}" height="${(tY(cty.latMin)-tY(cty.latMax)).toFixed(1)}" fill="#1c3020" stroke="rgba(80,180,80,0.5)" stroke-width="1"/>`,
-  ];
+  const tileCvs = document.createElement('canvas');
+  tileCvs.width = tW; tileCvs.height = tH;
+  const tileCtx = tileCvs.getContext('2d');
+  tileCtx.fillStyle = '#aad3df';
+  tileCtx.fillRect(0, 0, tW, tH);
 
-  for (const poly of visiblePassPolys) {
-    const pts = [...poly.left, ...[...poly.right].reverse()];
-    const d = pts.map((p, i) => `${i===0?'M':'L'}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(' ') + ' Z';
-    parts.push(`<path d="${d}" fill="${passColor}" opacity="0.35"/>`);
+  await Promise.all(
+    Array.from({ length: tileXMax - tileXMin + 1 }, (_, i) => tileXMin + i).flatMap(tx =>
+      Array.from({ length: tileYMax - tileYMin + 1 }, (_, j) => tileYMin + j).map(ty =>
+        new Promise(res => {
+          const img = new window.Image();
+          img.crossOrigin = 'anonymous';
+          const dx = (tx - tileXMin) * 256, dy = (ty - tileYMin) * 256;
+          img.onload = () => { tileCtx.drawImage(img, dx, dy, 256, 256); res(); };
+          img.onerror = () => { tileCtx.fillStyle = '#c8d8b0'; tileCtx.fillRect(dx, dy, 256, 256); res(); };
+          img.src = `https://${['a','b','c'][(tx + ty) % 3]}.tile.openstreetmap.org/${zoom}/${tx}/${ty}.png`;
+        })
+      )
+    )
+  );
+
+  // Crop tile composite to viewport → draw into final canvas
+  const vpxL = ((vLonMin + 180) / 360 * n - tileXMin) * 256;
+  const vpxR = ((vLonMax + 180) / 360 * n - tileXMin) * 256;
+  const vpyT = ((1 - latToMerc(vLatMax) / Math.PI) / 2 * n - tileYMin) * 256;
+  const vpyB = ((1 - latToMerc(vLatMin) / Math.PI) / 2 * n - tileYMin) * 256;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(tileCvs, vpxL, vpyT, vpxR - vpxL, vpyB - vpyT, 0, 0, W, H);
+
+  // Light whitening overlay (matches app's rgba(255,255,255,0.1))
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Grid lines ──
+  const gStep = dLat > 15 ? 5 : dLat > 5 ? 2 : dLat > 2 ? 1 : 0.5;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+  ctx.lineWidth = 0.7;
+  ctx.font = '9px monospace';
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  for (let la = Math.ceil(vLatMin / gStep) * gStep; la <= vLatMax; la += gStep) {
+    ctx.beginPath(); ctx.moveTo(0, tY(la)); ctx.lineTo(W, tY(la)); ctx.stroke();
+    ctx.fillText(`${la.toFixed(gStep < 1 ? 1 : 0)}°`, 4, tY(la) - 2);
   }
+  for (let lo = Math.ceil(vLonMin / gStep) * gStep; lo <= vLonMax; lo += gStep) {
+    ctx.beginPath(); ctx.moveTo(tX(lo), 0); ctx.lineTo(tX(lo), H); ctx.stroke();
+    ctx.fillText(`${lo.toFixed(gStep < 1 ? 1 : 0)}°`, tX(lo) + 2, H - 4);
+  }
+  ctx.restore();
+
+  // ── Country border ──
+  const bdr = BORDERS[cty.id];
+  ctx.save();
+  ctx.beginPath();
+  if (bdr && bdr.length > 0) {
+    bdr.forEach(([lo, la], i) => { if (i === 0) ctx.moveTo(tX(lo), tY(la)); else ctx.lineTo(tX(lo), tY(la)); });
+    ctx.closePath();
+  } else {
+    ctx.rect(tX(cty.lonMin), tY(cty.latMax), tX(cty.lonMax) - tX(cty.lonMin), tY(cty.latMin) - tY(cty.latMax));
+  }
+  ctx.fillStyle = 'rgba(120,175,100,0.15)';
+  ctx.fill();
+  ctx.setLineDash([8, 4]);
+  ctx.strokeStyle = '#2a6020';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = '#1a5018';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Swath polygons ──
+  ctx.save();
+  ctx.fillStyle = 'rgba(30,100,220,0.18)';
+  ctx.strokeStyle = 'rgba(30,100,220,0.05)';
+  ctx.lineWidth = 0.3;
+  for (const poly of visiblePassPolys) {
+    if (poly.left.length < 2) continue;
+    ctx.beginPath();
+    poly.left.forEach((p, i) => { if (i === 0) ctx.moveTo(tX(p.lon), tY(p.lat)); else ctx.lineTo(tX(p.lon), tY(p.lat)); });
+    [...poly.right].reverse().forEach(p => ctx.lineTo(tX(p.lon), tY(p.lat)));
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // ── Track center lines ──
+  ctx.save();
+  ctx.strokeStyle = 'rgba(15,70,200,0.8)';
+  ctx.lineWidth = 1.5;
   for (const poly of visiblePassPolys) {
     if (poly.center.length < 2) continue;
-    const d = poly.center.map((p, i) => `${i===0?'M':'L'}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(' ');
-    parts.push(`<path d="${d}" fill="none" stroke="${lineColor}" stroke-width="1.2" opacity="0.85"/>`);
+    ctx.beginPath();
+    poly.center.forEach((p, i) => { if (i === 0) ctx.moveTo(tX(p.lon), tY(p.lat)); else ctx.lineTo(tX(p.lon), tY(p.lat)); });
+    ctx.stroke();
   }
+  ctx.restore();
 
-  const label = `${cty.name} · ${tfDays}d · ${sunlitOnly ? 'Sunlit' : 'All'} · ${visiblePassPolys.length} passes`;
-  parts.push(`<rect x="0" y="${svgH-18}" width="${svgW}" height="18" fill="rgba(0,0,0,0.55)"/>`);
-  parts.push(`<text x="6" y="${svgH-5}" font-size="9" fill="rgba(200,230,255,0.85)" font-family="monospace">${label}</text>`);
-  parts.push(`</svg>`);
-
-  return new Promise(resolve => {
-    const img = new window.Image();
-    const blob = new Blob([parts.join('')], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = svgW; canvas.height = svgH;
-      canvas.getContext('2d').drawImage(img, 0, 0);
-      URL.revokeObjectURL(url);
-      resolve(canvas.toDataURL('image/jpeg', 0.85));
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
-    img.src = url;
+  // ── Info badge (top-left) ──
+  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
+  const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
+  const covKm2 = sunlitIdxs.reduce((s, i) => s + sw * (passLengthsKm[i] || 0), 0);
+  const fmtA = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(1)}k` : v.toFixed(0);
+  const lines = [
+    { text: cty.name, font: 'bold 14px monospace', fill: '#ffffff' },
+    { text: sat.name, font: 'bold 11px monospace', fill: sat.color || '#64FFDA' },
+    { text: `${sat.altitude}km · ${sat.inclination}° · ${sw.toFixed(0)}km swath · ${visiblePassPolys.length}${sunlitOnly ? ' ☀' : ''} passes/${tfDays}d`, font: '9px monospace', fill: 'rgba(200,220,240,0.65)' },
+    covKm2 > 0 ? { text: `☀ ${fmtA(covKm2)} km² imaged / ${fmtA(cty.area)} km²`, font: 'bold 10px monospace', fill: '#64FFDA' } : null,
+  ].filter(Boolean);
+  const badgeH = lines.length * 16 + 12;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  roundRect(ctx, 8, 8, 220, badgeH, 6);
+  ctx.fill();
+  lines.forEach((l, i) => {
+    ctx.font = l.font; ctx.fillStyle = l.fill;
+    ctx.fillText(l.text, 16, 24 + i * 16);
   });
+  ctx.restore();
+
+  // ── Orbital params badge (bottom-left) ──
+  const T = orbPeriod(sat.altitude);
+  const cosM = Math.cos(midLat * DEG);
+  const gapKm = ((360 / (86400 / T)) * (2 * Math.PI * R_E / 360) * cosM).toFixed(0);
+  const params = [
+    ['Orbits/d', (86400 / T).toFixed(1)],
+    ['Ω̇', `${nodalPrec(sat.altitude, sat.inclination, sat.eccentricity || 0).toFixed(2)}°/d`],
+    ['Gap', `~${gapKm}km`],
+    ['Area', `${(cty.area/1000).toFixed(0)}k km²`],
+  ];
+  const pBadgeW = params.length * 70 + 16;
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.68)';
+  roundRect(ctx, 8, H - 42, pBadgeW, 34, 4);
+  ctx.fill();
+  params.forEach(([k, v], i) => {
+    const px = 16 + i * 70;
+    ctx.font = '8px monospace'; ctx.fillStyle = 'rgba(160,190,210,0.55)';
+    ctx.fillText(k, px, H - 27);
+    ctx.font = 'bold 10px monospace'; ctx.fillStyle = '#a0c8e0';
+    ctx.fillText(v, px, H - 13);
+  });
+  ctx.restore();
+
+  return canvas.toDataURL('image/jpeg', 0.92);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
 }
 
 function dataUrlToUint8Array(dataUrl) {
@@ -1447,30 +1578,56 @@ export default function App() {
       });
 
       // ── GROUND TRACK MAP IMAGES ──
-      // 6 timeframes × 2 modes = 12 images per sat × country
+      // 2-column grid: All passes | Sunlit — one row per timeframe (6 rows × 2 cols = 12 per sat×country)
+      // Each map: 600×480 canvas, displayed at 440×352 in Word (fits 2 per A4-landscape row with margins)
+      const IMG_W = 440, IMG_H = 352;
       const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
       const mapChildren = [];
+
+      const mkImgCell = (imgData, caption) => new TableCell({
+        width: { size: 50, type: WidthType.PERCENTAGE },
+        children: [
+          new Paragraph({
+            children: imgData ? [new ImageRun({ data: imgData, transformation: { width: IMG_W, height: IMG_H }, type: "jpg" })] : [new TextRun({ text: "(no data)", size: 16 })],
+            spacing: { after: 60 },
+          }),
+          new Paragraph({ children: [new TextRun({ text: caption, size: 14, color: "555555" })], spacing: { after: 160 } }),
+        ],
+      });
+
       for (const sat of sats) {
         const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
         const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
         for (const cty of selCtyObjs) {
-          mapChildren.push(new Paragraph({ text: `${sat.name} → ${cty.name}`, heading: HeadingLevel.HEADING_3 }));
-          const grid = [];
-          for (const { l, d } of TRACK_TF_OPTS) {
-            for (const sunlit of [false, true]) {
-              const dataUrl = await renderTrackMapToDataURL(effSat, cty, anchorOffset, d, sunlit, 480, 340);
-              if (!dataUrl) continue;
-              const imgData = dataUrlToUint8Array(dataUrl);
-              grid.push(new Paragraph({
-                children: [
-                  new TextRun({ text: `${l} · ${sunlit ? 'Sunlit' : 'All passes'}  `, size: 14 }),
-                  new ImageRun({ data: imgData, transformation: { width: 480, height: 340 }, type: "jpg" }),
-                ],
-                spacing: { after: 120 },
-              }));
-            }
-          }
-          mapChildren.push(...grid);
+          mapChildren.push(new Paragraph({ text: `${sat.name} → ${cty.name}  ·  ${sat.altitude}km / ${sat.inclination}°`, heading: HeadingLevel.HEADING_3 }));
+          // Column headers
+          mapChildren.push(new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            rows: [
+              new TableRow({ children: [
+                new TableCell({ width: { size: 50, type: WidthType.PERCENTAGE }, children: [new Paragraph({ children: [new TextRun({ text: "ALL PASSES", bold: true, size: 18 })] })] }),
+                new TableCell({ width: { size: 50, type: WidthType.PERCENTAGE }, children: [new Paragraph({ children: [new TextRun({ text: "☀ SUNLIT ONLY", bold: true, size: 18 })] })] }),
+              ]}),
+              // One row per timeframe
+              ...await Promise.all(TRACK_TF_OPTS.map(async ({ l, d }) => {
+                const [allUrl, sunUrl] = await Promise.all([
+                  renderTrackMapToDataURL(effSat, cty, anchorOffset, d, false, 600, 480),
+                  renderTrackMapToDataURL(effSat, cty, anchorOffset, d, true,  600, 480),
+                ]);
+                const allData = allUrl ? dataUrlToUint8Array(allUrl) : null;
+                const sunData = sunUrl ? dataUrlToUint8Array(sunUrl) : null;
+                // Count passes for caption
+                const { passes: allP, passMidTimes: allMT } = computePasses(effSat, cty, d, anchorOffset);
+                const nAll = allP.length;
+                const nSun = allP.filter((_, i) => isInImagingWindow(allMT[i], (cty.latMin+cty.latMax)/2, (cty.lonMin+cty.lonMax)/2)).length;
+                return new TableRow({ children: [
+                  mkImgCell(allData, `${cty.name} · ${sat.name} · ${d}d · All passes · ${nAll} passes`),
+                  mkImgCell(sunData, `${cty.name} · ${sat.name} · ${d}d · Sunlit · ${nSun} passes`),
+                ]});
+              })),
+            ],
+          }));
+          mapChildren.push(new Paragraph({ text: "", spacing: { after: 400 } }));
         }
       }
 
