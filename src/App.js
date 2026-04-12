@@ -1234,6 +1234,15 @@ export default function App() {
                     <span style={{ fontSize: 8, color: "#2a4a60" }}>in this plane</span>
                   </div>
 
+                  {/* Daily imaging capacity */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 5 }}>
+                    <span style={{ fontSize: 8, color: "#3a6080", letterSpacing: 1 }}>CAP:</span>
+                    <input type="number" min="0" value={sat.dataCapacity}
+                      onChange={e => setSats(p => p.map(s => s.id === sat.id ? { ...s, dataCapacity: +e.target.value || 0 } : s))}
+                      style={{ width: 72, background: "rgba(4,8,16,0.9)", border: "1px solid rgba(70,140,200,0.2)", color: "#a0d0e8", padding: "2px 4px", borderRadius: 3, fontSize: 9, fontFamily: "inherit", textAlign: "center" }} />
+                    <span style={{ fontSize: 8, color: "#2a4a60" }}>km²/d</span>
+                  </div>
+
                   {/* Add variant on different orbit */}
                   <button onClick={() => {
                     const newInc = sat.inclination > 50 ? 45 : 97.4;
