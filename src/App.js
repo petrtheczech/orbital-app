@@ -510,13 +510,11 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
   const { passPolys, passes, passMidTimes, passLengthsKm } = computePasses(sat, cty, tfDays, anchorOffset);
   const midLat = (cty.latMin + cty.latMax) / 2;
   const midLon = (cty.lonMin + cty.lonMax) / 2;
-  const visiblePassPolys = sunlitOnly
-    ? passPolys.filter((_, i) => isInImagingWindow(passMidTimes[i], midLat, midLon))
-    : passPolys;
+  const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
 
   // Viewport & Mercator projection (identical to CountryTrackMap)
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
-  const margin = Math.max(dLat, dLon) * 0.3;
+  const margin = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
   const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
   const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
   const vdLon = vLonMax - vLonMin;
@@ -611,28 +609,19 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
   ctx.stroke();
   ctx.restore();
 
-  // ── Swath polygons ──
+  // ── Track center lines (no swath corridor — only nadir track lines) ──
   ctx.save();
-  ctx.fillStyle = 'rgba(30,100,220,0.18)';
-  ctx.strokeStyle = 'rgba(30,100,220,0.05)';
-  ctx.lineWidth = 0.3;
-  for (const poly of visiblePassPolys) {
-    if (poly.left.length < 2) continue;
-    ctx.beginPath();
-    poly.left.forEach((p, i) => { if (i === 0) ctx.moveTo(tX(p.lon), tY(p.lat)); else ctx.lineTo(tX(p.lon), tY(p.lat)); });
-    [...poly.right].reverse().forEach(p => ctx.lineTo(tX(p.lon), tY(p.lat)));
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-  }
-  ctx.restore();
-
-  // ── Track center lines ──
-  ctx.save();
-  ctx.strokeStyle = 'rgba(15,70,200,0.8)';
-  ctx.lineWidth = 1.5;
-  for (const poly of visiblePassPolys) {
+  ctx.strokeStyle = 'rgba(15,70,200,0.85)';
+  ctx.lineWidth = 2;
+  for (let pi = 0; pi < passPolys.length; pi++) {
+    const poly = passPolys[pi];
     if (poly.center.length < 2) continue;
+    // Cull passes entirely outside the visible viewport
+    const inView = poly.center.some(p =>
+      p.lat >= vLatMin - 1 && p.lat <= vLatMax + 1 &&
+      p.lon >= vLonMin - 1 && p.lon <= vLonMax + 1
+    );
+    if (!inView) continue;
     ctx.beginPath();
     poly.center.forEach((p, i) => { if (i === 0) ctx.moveTo(tX(p.lon), tY(p.lat)); else ctx.lineTo(tX(p.lon), tY(p.lat)); });
     ctx.stroke();
@@ -641,13 +630,12 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
 
   // ── Info badge (top-left) ──
   const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
-  const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
   const covKm2 = sunlitIdxs.reduce((s, i) => s + sw * (passLengthsKm[i] || 0), 0);
   const fmtA = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(1)}k` : v.toFixed(0);
   const lines = [
     { text: cty.name, font: 'bold 14px monospace', fill: '#ffffff' },
     { text: sat.name, font: 'bold 11px monospace', fill: sat.color || '#64FFDA' },
-    { text: `${sat.altitude}km · ${sat.inclination}° · ${sw.toFixed(0)}km swath · ${visiblePassPolys.length}${sunlitOnly ? ' ☀' : ''} passes/${tfDays}d`, font: '9px monospace', fill: 'rgba(200,220,240,0.65)' },
+    { text: `${sat.altitude}km · ${sat.inclination}° · ${sw.toFixed(0)}km swath · ${sunlitOnly ? sunlitIdxs.length : passes.length}${sunlitOnly ? ' ☀' : ''} passes/${tfDays}d`, font: '9px monospace', fill: 'rgba(200,220,240,0.65)' },
     covKm2 > 0 ? { text: `☀ ${fmtA(covKm2)} km² imaged / ${fmtA(cty.area)} km²`, font: 'bold 10px monospace', fill: '#64FFDA' } : null,
   ].filter(Boolean);
   const badgeH = lines.length * 16 + 12;
@@ -712,7 +700,7 @@ function useMapImage(cty, svgW, svgH) {
   const canvasRef = useRef(null);
 
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
-  const margin = Math.max(dLat, dLon) * 0.3;
+  const margin = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
   const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
   const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
 
@@ -804,16 +792,14 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
 
   const midLat = (country.latMin + country.latMax) / 2;
   const midLon = (country.lonMin + country.lonMax) / 2;
-  const visiblePassPolys = sunlitOnly
-    ? passPolys.filter((_, i) => isInImagingWindow(passMidTimes[i], midLat, midLon))
-    : passPolys;
+  const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
+  // visiblePasses used for badge count only
   const visiblePasses = sunlitOnly
-    ? passes.filter((_, i) => isInImagingWindow(passMidTimes[i], midLat, midLon))
+    ? passes.filter((_, i) => sunlitIdxs.includes(i))
     : passes;
 
   // Sunlit covered area (always sunlit-only, regardless of toggle), capped at daily capacity
   const swKm = effSwathKm(sat.altitude, sat.swathAngle || 10);
-  const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
   const uncappedCovKm2 = sunlitIdxs.reduce((sum, i) => sum + swKm * (passLengthsKm[i] || 0), 0);
   const dailyCap = sat.dataCapacity || 0;
   const covKm2 = dailyCap > 0 ? Math.min(uncappedCovKm2, dailyCap * tfDays) : uncappedCovKm2;
@@ -821,7 +807,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
 
   const cty = country;
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
-  const margin = Math.max(dLat, dLon) * 0.3;
+  const margin = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
   const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
   const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
   const vdLon = vLonMax - vLonMin;
@@ -911,19 +897,19 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
           {/* Country border fill */}
           <polygon points={bdrPath} fill={mapImg ? "rgba(120,175,100,0.15)" : "rgba(120,175,100,0.45)"} stroke="#2a6020" strokeWidth="2.5" strokeDasharray="8,4" />
 
-          {/* Swath bands and track lines — clipped explicitly to viewport */}
+          {/* Track lines — clipped to viewport, sunlit filter applied per-pass */}
           <g clipPath={`url(#vp-${cty.id})`}>
-            {visiblePassPolys.map((poly, pi) => {
-              if (poly.left.length < 2) return null;
-              const lPts = poly.left.map(p => `${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`);
-              const rPts = [...poly.right].reverse().map(p => `${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`);
-              return <polygon key={`sw${pi}`} points={[...lPts, ...rPts].join(" ")}
-                fill="rgba(30,100,220,0.18)" stroke="rgba(30,100,220,0.05)" strokeWidth="0.3" />;
-            })}
-            {visiblePassPolys.map((poly, pi) => {
+            {passPolys.map((poly, pi) => {
+              if (sunlitOnly && !isInImagingWindow(passMidTimes[pi], midLat, midLon)) return null;
               if (poly.center.length < 2) return null;
+              // Cull passes entirely outside the visible viewport (1° slop for edge-crossing passes)
+              const inView = poly.center.some(p =>
+                p.lat >= vLatMin - 1 && p.lat <= vLatMax + 1 &&
+                p.lon >= vLonMin - 1 && p.lon <= vLonMax + 1
+              );
+              if (!inView) return null;
               const d = poly.center.map((p, i) => `${i === 0 ? "M" : "L"}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(" ");
-              return <path key={`tk${pi}`} d={d} fill="none" stroke="rgba(15,70,200,0.8)" strokeWidth="1.5" />;
+              return <path key={`tk${pi}`} d={d} fill="none" stroke="rgba(15,70,200,0.85)" strokeWidth="2" />;
             })}
           </g>
 
