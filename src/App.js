@@ -98,14 +98,27 @@ function computeOptimalRaan(sat, anchorCty) {
     raan = ((raan % 360) + 360) % 360;
     return raan;
   } else {
-    // Prograde: ascending node at RAAN, ascending through target
-    const sinR = Math.sin(Math.abs(targetLat) * DEG) / Math.sin(Math.max(inc, 1) * DEG);
-    const u = Math.asin(Math.min(1, Math.max(-1, sinR)));
-    const tToTgt = (u / (2 * Math.PI)) * T;
-    const earthRotDeg = OMEGA_E * tToTgt * RAD;
-    let raan = targetLon + earthRotDeg;
-    raan = ((raan % 360) + 360) % 360;
-    return raan;
+    // Prograde: find both u crossings at targetLat, pick the one that arrives soonest
+    const sinU = Math.sin(targetLat * DEG) / Math.sin(Math.max(inc, 1) * DEG);
+    if (Math.abs(sinU) > 1) {
+      // Target latitude unreachable — fallback: ascending node points at target lon
+      return ((targetLon % 360) + 360) % 360;
+    }
+    const asinU = Math.asin(sinU);
+    // Two crossings per orbit: ascending leg (u1) and descending leg (u2)
+    const u1 = asinU < 0 ? asinU + 2 * Math.PI : asinU; // normalized to [0, 2π]
+    const u2 = Math.PI - asinU;                            // descending crossing
+    let bestRaan = ((targetLon % 360) + 360) % 360;
+    let bestT = Infinity;
+    for (const u of [u1, u2]) {
+      const tToTgt = (u / (2 * Math.PI)) * T;
+      if (tToTgt < bestT) {
+        bestT = tToTgt;
+        const earthRotDeg = OMEGA_E * tToTgt * RAD;
+        bestRaan = ((targetLon + earthRotDeg) % 360 + 360) % 360;
+      }
+    }
+    return bestRaan;
   }
 }
 
@@ -983,7 +996,9 @@ export default function App() {
           }
 
           // Sunlit-only passes
-          const sunlitPasses = allPasses.filter(p => isInImagingWindow(p.midT, cty.lat, cty.lon));
+          const ctyMidLat = (cty.latMin + cty.latMax) / 2;
+          const ctyMidLon = (cty.lonMin + cty.lonMax) / 2;
+          const sunlitPasses = allPasses.filter(p => isInImagingWindow(p.midT, ctyMidLat, ctyMidLon));
           const sunlitPassCountByTf = {};
           for (const bucket of passBuckets) {
             sunlitPassCountByTf[bucket] = sunlitPasses.filter(p =>
@@ -1015,7 +1030,7 @@ export default function App() {
           const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
 
           // Sunlit grid analysis
-          const sunlitPts = trackPts.filter(p => isInImagingWindow(p.t, cty.lat, cty.lon));
+          const sunlitPts = trackPts.filter(p => isInImagingWindow(p.t, ctyMidLat, ctyMidLon));
           const sfirstVisit = new Float64Array(gN * gN).fill(Infinity);
           const slastVisit = new Float64Array(gN * gN).fill(-1);
           const srevisitSum = new Float64Array(gN * gN);
