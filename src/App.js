@@ -1184,12 +1184,8 @@ export default function App() {
       area: selCtyObjs.reduce((s, c) => s + c.area, 0),
     };
   }, [selCtyObjs]);
-  const combinedViewValid = Boolean(
-    combinedBounds &&
-    combinedBounds.latMax - combinedBounds.latMin <= 15 &&
-    combinedBounds.lonMax - combinedBounds.lonMin <= 15
-  );
-  // Auto-reset combined view when it becomes invalid (e.g. countries deselected)
+  const combinedViewValid = Boolean(combinedBounds);
+  // Auto-reset combined view when fewer than 2 countries are selected
   useEffect(() => { if (!combinedViewValid) setCombinedView(false); }, [combinedViewValid]);
   const [commercialRate, setCommercialRate] = useState(15); // €/km²
   const [form, setForm] = useState({
@@ -2212,7 +2208,7 @@ export default function App() {
                     return (
                       <button key={String(val)}
                         onClick={() => { if (!disabled) setCombinedView(val); }}
-                        title={disabled ? "Countries too far apart for combined view (>15° span)" : ""}
+                        title={disabled ? "Select 2+ countries to enable combined view" : ""}
                         style={{
                           flex: 1, padding: "5px 4px", borderRadius: 4,
                           cursor: disabled ? "not-allowed" : "pointer",
@@ -2512,7 +2508,7 @@ export default function App() {
                 Zoomed maps showing full ground track lines over each target country. Use the timeframe buttons below each map to see track buildup over 1 day → 30 days. Green cells = covered area.
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8 }}>
-                {combinedView && combinedViewValid ? (
+                {combinedView && combinedBounds ? (
                   sats.map(sat => {
                     const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
                     const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
