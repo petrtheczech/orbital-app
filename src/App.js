@@ -1653,12 +1653,29 @@ export default function App() {
       });
 
       // ── GROUND TRACK MAP IMAGES ──
-      // 2-column grid: All passes | Sunlit — one row per timeframe (6 rows × 2 cols = 12 per sat×country)
-      // Each map: 600×480 canvas, displayed at 440×352 in Word (fits 2 per A4-landscape row with margins)
-      const IMG_W = 440, IMG_H = 352;
+      // Pre-render every (sat × cty × timeframe × mode) combination once into a cache,
+      // then reuse those renders for both the per-satellite detail section AND the
+      // comparison collages. Avoids duplicate OSM tile loads.
       const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
-      const mapChildren = [];
+      const mapCache = new Map(); // key: `${sat.id}|${cty.id}|${d}|${sunlit}`
+      for (const sat of sats) {
+        const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+        const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
+        for (const cty of selCtyObjs) {
+          await Promise.all(
+            TRACK_TF_OPTS.flatMap(({ d }) =>
+              [false, true].map(async (sunlit) => {
+                const url = await renderTrackMapToDataURL(effSat, cty, anchorOffset, d, sunlit, 600, 480);
+                mapCache.set(`${sat.id}|${cty.id}|${d}|${sunlit}`, url ? dataUrlToUint8Array(url) : null);
+              })
+            )
+          );
+        }
+      }
+      const getMap = (satId, ctyId, d, sunlit) => mapCache.get(`${satId}|${ctyId}|${d}|${sunlit}`) ?? null;
 
+      // ── SECTION 1: per-satellite detail grid (ALL | SUNLIT side-by-side per timeframe) ──
+      const IMG_W = 440, IMG_H = 352;
       const mkImgCell = (imgData, caption) => new TableCell({
         width: { size: 50, type: WidthType.PERCENTAGE },
         children: [
@@ -1669,13 +1686,12 @@ export default function App() {
           new Paragraph({ children: [new TextRun({ text: caption, size: 14, color: "555555" })], spacing: { after: 160 } }),
         ],
       });
-
+      const mapChildren = [];
       for (const sat of sats) {
         const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
         const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
         for (const cty of selCtyObjs) {
           mapChildren.push(new Paragraph({ text: `${sat.name} → ${cty.name}  ·  ${sat.altitude}km / ${sat.inclination}°`, heading: HeadingLevel.HEADING_3 }));
-          // Column headers
           mapChildren.push(new Table({
             width: { size: 100, type: WidthType.PERCENTAGE },
             rows: [
@@ -1683,15 +1699,9 @@ export default function App() {
                 new TableCell({ width: { size: 50, type: WidthType.PERCENTAGE }, children: [new Paragraph({ children: [new TextRun({ text: "ALL PASSES", bold: true, size: 18 })] })] }),
                 new TableCell({ width: { size: 50, type: WidthType.PERCENTAGE }, children: [new Paragraph({ children: [new TextRun({ text: "☀ SUNLIT ONLY", bold: true, size: 18 })] })] }),
               ]}),
-              // One row per timeframe
-              ...await Promise.all(TRACK_TF_OPTS.map(async ({ l, d }) => {
-                const [allUrl, sunUrl] = await Promise.all([
-                  renderTrackMapToDataURL(effSat, cty, anchorOffset, d, false, 600, 480),
-                  renderTrackMapToDataURL(effSat, cty, anchorOffset, d, true,  600, 480),
-                ]);
-                const allData = allUrl ? dataUrlToUint8Array(allUrl) : null;
-                const sunData = sunUrl ? dataUrlToUint8Array(sunUrl) : null;
-                // Count passes for caption
+              ...TRACK_TF_OPTS.map(({ l, d }) => {
+                const allData = getMap(sat.id, cty.id, d, false);
+                const sunData = getMap(sat.id, cty.id, d, true);
                 const { passes: allP, passMidTimes: allMT } = computePasses(effSat, cty, d, anchorOffset);
                 const nAll = allP.length;
                 const nSun = allP.filter((_, i) => isInImagingWindow(allMT[i], (cty.latMin+cty.latMax)/2, (cty.lonMin+cty.lonMax)/2)).length;
@@ -1699,10 +1709,69 @@ export default function App() {
                   mkImgCell(allData, `${cty.name} · ${sat.name} · ${d}d · All passes · ${nAll} passes`),
                   mkImgCell(sunData, `${cty.name} · ${sat.name} · ${d}d · Sunlit · ${nSun} passes`),
                 ]});
-              })),
+              }),
             ],
           }));
           mapChildren.push(new Paragraph({ text: "", spacing: { after: 400 } }));
+        }
+      }
+
+      // ── SECTION 2: comparison collages ──
+      // One collage per country per mode (ALL / SUNLIT).
+      // Grid: columns = satellites, rows = timeframes.
+      // Sized to fit nSats columns on a landscape A4 page.
+      const nSats = sats.length;
+      const labelPct = Math.max(6, Math.round(60 / Math.max(nSats, 1)));  // shrink label as sats grow
+      const imgPct = Math.max(1, Math.floor((100 - labelPct) / Math.max(1, nSats)));
+      // Display size in pixels: fill the column (page ~950px wide at 96dpi)
+      const collDispW = Math.min(380, Math.floor(950 * imgPct / 100) - 6);
+      const collDispH = Math.round(collDispW * 4 / 5);
+
+      const mkCHdr = (text, pct) => new TableCell({
+        width: { size: pct, type: WidthType.PERCENTAGE },
+        children: [new Paragraph({ children: [new TextRun({ text: String(text), bold: true, size: 18 })], alignment: AlignmentType.CENTER, spacing: { before: 60, after: 60 } })],
+      });
+      const mkCLbl = (text) => new TableCell({
+        width: { size: labelPct, type: WidthType.PERCENTAGE },
+        children: [new Paragraph({ children: [new TextRun({ text: String(text), bold: true, size: 16 })], alignment: AlignmentType.CENTER, spacing: { before: 40, after: 40 } })],
+      });
+      const mkCImg = (data, pct) => new TableCell({
+        width: { size: pct, type: WidthType.PERCENTAGE },
+        children: [new Paragraph({
+          children: data
+            ? [new ImageRun({ data, transformation: { width: collDispW, height: collDispH }, type: "jpg" })]
+            : [new TextRun({ text: "—", size: 16, color: "888888" })],
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 20, after: 20 },
+        })],
+      });
+
+      const collageChildren = [];
+      for (const cty of selCtyObjs) {
+        for (const [sunlit, modeLabel] of [[false, "ALL PASSES"], [true, "SUNLIT PASSES"]]) {
+          const collTitle = `Coverage Comparison — ${modeLabel} — ${cty.name}`;
+          collageChildren.push(new Paragraph({
+            children: [new TextRun({ text: collTitle, bold: true, size: 28 })],
+            pageBreakBefore: true,
+            spacing: { after: 200 },
+          }));
+          const headerRow = new TableRow({ children: [
+            mkCHdr("", labelPct),
+            ...sats.map(sat => {
+              const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+              return mkCHdr(`${sat.name}\n${effSat.altitude}km · ${effSat.inclination}°`, imgPct);
+            }),
+          ]});
+          const dataRows = TRACK_TF_OPTS.map(({ l, d }) =>
+            new TableRow({ children: [
+              mkCLbl(l),
+              ...sats.map(sat => mkCImg(getMap(sat.id, cty.id, d, sunlit), imgPct)),
+            ]})
+          );
+          collageChildren.push(new Table({
+            width: { size: 100, type: WidthType.PERCENTAGE },
+            rows: [headerRow, ...dataRows],
+          }));
         }
       }
 
@@ -1727,6 +1796,8 @@ export default function App() {
 
             new Paragraph({ text: "Ground Track Maps", heading: HeadingLevel.HEADING_2 }),
             ...mapChildren,
+
+            ...collageChildren,
           ]
         }]
       });
