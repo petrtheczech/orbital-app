@@ -1323,7 +1323,7 @@ export default function App() {
             firstViewAllDay = allPassDays30.length > 0 ? 30 * stripsForView / allPassDays30.length : null;
             firstViewSunlitDay = sunlitPassDays30.length > 0 ? 30 * stripsForView / sunlitPassDays30.length : null;
           }
-          // 100% Mapped: time to image every point using optimal nadir-strip scheduling
+          // 100% Mapped (clear sky): time to image every point using optimal nadir-strip scheduling
           // Uses nadir swath (not corridor) because each imaging strip must be captured
           const stripsNeeded100 = Math.ceil(perpWidth_km / sw);
           const sunlitCnt30 = sunlitPassDays30.length;
@@ -1331,6 +1331,29 @@ export default function App() {
           const hundredPctMappedSunlitDays = sunlitCnt30 > 0 ? 30 * stripsNeeded100 / sunlitCnt30 : null;
           const hundredPctMappedAllDays = allCnt30 > 0 ? 30 * stripsNeeded100 / allCnt30 : null;
           const offNadirNote = offNadirDeg === 0; // flag: no off-nadir steering available
+
+          // ── Cloud-adjusted variants ──
+          // cloudFrac already computed above as (cloudPct/100); clearFrac = 1 - cloudFrac
+          // First View (cloud): expected day of first CLEAR sunlit pass over any given point.
+          // On average, passesNeeded = 1/(1-cloudFrac) attempts to get one clear pass.
+          // firstViewCloud = firstSunlitPassDay + (passesNeeded-1) × meanSunlitRevisit
+          const cloudFrac = cloudPct / 100;
+          const effectiveClearFrac = Math.max(0.01, 1 - cloudFrac); // avoid div/0
+          const passesNeededForView = 1 / effectiveClearFrac; // e.g. 2.22 for 55% cloud
+          const firstViewSunlitCloud = (firstViewSunlitDay !== null && sunlitMeanRevisitDays !== null)
+            ? firstViewSunlitDay + (passesNeededForView - 1) * sunlitMeanRevisitDays
+            : null;
+          const firstViewAllCloud = (firstViewAllDay !== null && meanRevisitDays !== null)
+            ? firstViewAllDay + (passesNeededForView - 1) * meanRevisitDays
+            : null;
+          // 100% Mapped (cloud): each sunlit pass has clearFrac chance of being usable.
+          // Need more passes to collect the same number of productive strips.
+          const hundredPctMappedSunlitCloud = hundredPctMappedSunlitDays !== null
+            ? hundredPctMappedSunlitDays / effectiveClearFrac
+            : null;
+          const hundredPctMappedAllCloud = hundredPctMappedAllDays !== null
+            ? hundredPctMappedAllDays / effectiveClearFrac
+            : null;
 
           // Covered area per timeframe (sunlit passes × swath × track length, capped at daily capacity)
           const coveredAreaSunlitByTf = {};
@@ -1459,7 +1482,9 @@ export default function App() {
             firstAllPassDay, meanRevisitDays, maxGapDays,
             firstSunlitPassDay, sunlitMeanRevisitDays, sunlitMaxGapDays,
             firstViewAllDay, firstViewSunlitDay,
+            firstViewAllCloud, firstViewSunlitCloud,
             hundredPctMappedSunlitDays, hundredPctMappedAllDays,
+            hundredPctMappedSunlitCloud, hundredPctMappedAllCloud,
             offNadirNote,
             passCountByTf,
             sunlitPassCountByTf,
@@ -1562,8 +1587,8 @@ export default function App() {
             mkCell(fmtD(r.meanRevisitDays), false, true),
             mkCell(fmtD(r.maxGapDays), false, true),
             mkCell(r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`, false, true),
-            mkCell(fmtDw(r.firstViewAllDay), false, true),
-            mkCell(fmtDw(r.hundredPctMappedAllDays) + (r.offNadirNote ? " (nadir)" : ""), false, true),
+            mkCell(fmtDw(r.firstViewAllDay) + (r.firstViewAllCloud ? ` / ${fmtDw(r.firstViewAllCloud)} ☁` : ""), false, true),
+            mkCell(fmtDw(r.hundredPctMappedAllDays) + (r.hundredPctMappedAllCloud ? ` / ${fmtDw(r.hundredPctMappedAllCloud)} ☁` : "") + (r.offNadirNote ? " (nadir)" : ""), false, true),
             ...[1,3,5,7,14,30].map(b => mkCell(String(pc[b]||0), false, true)),
           ]}),
           new TableRow({ children: [
@@ -1573,8 +1598,8 @@ export default function App() {
             mkCell(fmtD(r.sunlitMeanRevisitDays), false, true),
             mkCell(fmtD(r.sunlitMaxGapDays), false, true),
             mkCell("—", false, true),
-            mkCell(fmtDw(r.firstViewSunlitDay), false, true),
-            mkCell(fmtDw(r.hundredPctMappedSunlitDays) + (r.offNadirNote ? " (nadir)" : ""), false, true),
+            mkCell(fmtDw(r.firstViewSunlitDay) + (r.firstViewSunlitCloud ? ` / ${fmtDw(r.firstViewSunlitCloud)} ☁${r.cloudPct}%` : ""), false, true),
+            mkCell(fmtDw(r.hundredPctMappedSunlitDays) + (r.hundredPctMappedSunlitCloud ? ` / ${fmtDw(r.hundredPctMappedSunlitCloud)} ☁` : "") + (r.offNadirNote ? " (nadir)" : ""), false, true),
             ...[1,3,5,7,14,30].map(b => mkCell(String(spc[b]||0), false, true)),
           ]}),
         ];
@@ -2147,10 +2172,14 @@ export default function App() {
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#a0d0e8" }}>{fmtD(r.meanRevisitDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFD740" }}>{fmtD(r.maxGapDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: r.fullCovDay !== null ? "#64FFDA" : "#FF8A80" }}>{r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`}</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#64c8e8", fontWeight: 600 }}>{fmtD(r.firstViewAllDay)}</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a6a80", fontSize: 9 }}>
-                            {fmtD(r.hundredPctMappedAllDays)}
-                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#3a5060", marginTop: 1 }}>nadir only</div>}
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#64c8e8", fontWeight: 600, lineHeight: 1.4 }}>
+                            <div>{fmtD(r.firstViewAllDay)}</div>
+                            {r.firstViewAllCloud !== null && <div style={{ fontSize: 8, color: "#7090a0", fontWeight: 400 }}>{fmtD(r.firstViewAllCloud)} ☁</div>}
+                          </td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a6a80", fontSize: 9, lineHeight: 1.4 }}>
+                            <div>{fmtD(r.hundredPctMappedAllDays)}</div>
+                            {r.hundredPctMappedAllCloud !== null && <div style={{ fontSize: 8, color: "#7090a0" }}>{fmtD(r.hundredPctMappedAllCloud)} ☁</div>}
+                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#3a5060" }}>nadir only</div>}
                           </td>
                           {[1,3,5,7,14,30].map((b, bi) => (
                             <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: bi === 0 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (pc[b] || 0) === 0 ? "#3a4a58" : (pc[b] || 0) >= 5 ? "#64FFDA" : "#a0d0e8" }}>
@@ -2165,10 +2194,14 @@ export default function App() {
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300" }}>{fmtD(r.sunlitMeanRevisitDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#cc8800" }}>{fmtD(r.sunlitMaxGapDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a4a40" }}>—</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>{fmtD(r.firstViewSunlitDay)}</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>
-                            {fmtD(r.hundredPctMappedSunlitDays)}
-                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#806040", marginTop: 1 }}>nadir only</div>}
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700, lineHeight: 1.4 }}>
+                            <div>{fmtD(r.firstViewSunlitDay)}</div>
+                            {r.firstViewSunlitCloud !== null && <div style={{ fontSize: 8, color: "#a07820", fontWeight: 400 }}>{fmtD(r.firstViewSunlitCloud)} ☁{r.cloudPct}%</div>}
+                          </td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700, lineHeight: 1.4 }}>
+                            <div>{fmtD(r.hundredPctMappedSunlitDays)}</div>
+                            {r.hundredPctMappedSunlitCloud !== null && <div style={{ fontSize: 8, color: "#a07820", fontWeight: 400 }}>{fmtD(r.hundredPctMappedSunlitCloud)} ☁</div>}
+                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#806040" }}>nadir only</div>}
                           </td>
                           {[1,3,5,7,14,30].map((b, bi) => {
                             const ca = (r.coveredAreaSunlitByTf || {})[b];
