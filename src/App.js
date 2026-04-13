@@ -1663,23 +1663,23 @@ export default function App() {
       });
 
       // ── COMMERCIAL VALUE TABLE ──
-      const commHdr = mkHdr(["Satellite", "Country", "Passes/30d", "km²/yr", "Value/yr", "Value/lifetime"]);
+      const commHdr = mkHdr(["Satellite", "Country", "Passes/30d", "Gross km²/yr", "Cloud%", "Net km²/yr", "Value/yr (net)", "Value/lifetime (net)"]);
       const commRows = sats.flatMap(sat => {
         const satResults = (results || []).filter(r => r.satId === sat.id);
-        const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30), 0);
-        const dailyCap = satResults[0]?.satDataCapacity || 0;
-        const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
-        const imgPerYear = effectiveDaily * 365.25;
         return satResults.map(r => {
           const passesPerYear = (r.sunlitPassCountByTf[30]||0) * (365.25/30);
-          const annualKm2 = passesPerYear * r.avgSunlitPassLengthKm * r.swKm;
-          const annualValue = annualKm2 * commercialRate;
+          const grossAnnualKm2 = passesPerYear * r.avgSunlitPassLengthKm * r.swKm;
+          const cldFrac = (r.cloudPct || 50) / 100;
+          const netAnnualKm2 = grossAnnualKm2 * (1 - cldFrac);
+          const annualValue = netAnnualKm2 * commercialRate;
           const lifetimeValue = annualValue * (r.satLifetime||5);
           return new TableRow({ children: [
             mkCell(sat.name, true),
             mkCell(r.countryName),
             mkCell(String(r.sunlitPassCountByTf[30]||0), false, true),
-            mkCell(`${fmtN(annualKm2)} km²`, false, true),
+            mkCell(`${fmtN(grossAnnualKm2)} km²`, false, true),
+            mkCell(`${r.cloudPct}%`, false, true),
+            mkCell(`${fmtN(netAnnualKm2)} km²`, false, true),
             mkCell(fmtM(annualValue), false, true),
             mkCell(fmtM(lifetimeValue), false, true),
           ]});
@@ -2503,8 +2503,16 @@ export default function App() {
                 const imgPerMonth = effectiveDaily * 30.44;
                 const imgPerYear = effectiveDaily * 365.25;
                 const imgLifetime = imgPerYear * (satResults[0].satLifetime || 5);
-                const valuePerYear = imgPerYear * commercialRate;
-                const valueLifetime = imgLifetime * commercialRate;
+                // Net (cloud-corrected): apply per-country cloud fraction then re-aggregate
+                const totalNetDaily = satResults.reduce((s, r) => {
+                  const cf = 1 - (r.cloudPct || 50) / 100;
+                  return s + ((r.uncappedSunlitAreaByTf[30] || 0) / 30) * cf;
+                }, 0);
+                const effectiveNetDaily = dailyCap > 0 ? Math.min(totalNetDaily, dailyCap) : totalNetDaily;
+                const netImgPerYear = effectiveNetDaily * 365.25;
+                const netImgLifetime = netImgPerYear * (satResults[0].satLifetime || 5);
+                const valuePerYear = netImgPerYear * commercialRate;
+                const valueLifetime = netImgLifetime * commercialRate;
                 return (
                   <div key={sat.id} style={{ marginBottom: 12, padding: "12px 14px", background: "rgba(4,8,16,0.6)", borderRadius: "0 6px 6px 0", border: "1px solid rgba(70,140,200,0.1)", borderLeft: `3px solid ${sat.color}` }}>
                     {/* Header */}
@@ -2513,12 +2521,24 @@ export default function App() {
                       <span style={{ fontSize: 8, color: "#3a6080" }}>{sat.altitude}km · {effSwathKm(sat.altitude, sat.swathAngle).toFixed(0)}km swath · {satResults[0].satLifetime}yr lifetime</span>
                     </div>
 
-                    {/* Imagery volume */}
+                    {/* Imagery volume — gross (sunlit) vs net (cloud-free) */}
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginBottom: 6 }}>
+                      {[
+                        ["Gross imagery / mo", `${fmt(imgPerMonth)} km²`, "#a0d0e8"],
+                        ["Gross imagery / yr", `${fmt(imgPerYear)} km²`, "#7090a8"],
+                        ["Gross imagery / lifetime", `${fmt(imgLifetime)} km²`, "#506878"],
+                      ].map(([k, v, c]) => (
+                        <div key={k} style={{ padding: "6px 8px", background: "rgba(0,0,0,0.25)", borderRadius: 4 }}>
+                          <div style={{ fontSize: 7, color: "#2a4a60", letterSpacing: 1, marginBottom: 2 }}>{k.toUpperCase()}</div>
+                          <div style={{ fontSize: 11, color: c, fontWeight: 700 }}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginBottom: 10 }}>
                       {[
-                        ["Sunlit imagery / mo", `${fmt(imgPerMonth)} km²`, "#a0d0e8"],
-                        ["Sunlit imagery / yr", `${fmt(imgPerYear)} km²`, "#FFD740"],
-                        ["Sunlit imagery / lifetime", `${fmt(imgLifetime)} km²`, "#64FFDA"],
+                        ["Net imagery / mo ☁", `${fmt(effectiveNetDaily * 30.44)} km²`, "#a0d0e8"],
+                        ["Net imagery / yr ☁", `${fmt(netImgPerYear)} km²`, "#FFD740"],
+                        ["Net imagery / lifetime ☁", `${fmt(netImgLifetime)} km²`, "#64FFDA"],
                       ].map(([k, v, c]) => (
                         <div key={k} style={{ padding: "6px 8px", background: "rgba(0,0,0,0.35)", borderRadius: 4 }}>
                           <div style={{ fontSize: 7, color: "#2a4a60", letterSpacing: 1, marginBottom: 2 }}>{k.toUpperCase()}</div>
@@ -2527,7 +2547,7 @@ export default function App() {
                       ))}
                     </div>
 
-                    {/* Commercial value */}
+                    {/* Commercial value (based on net cloud-free imagery) */}
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginBottom: 10 }}>
                       {[
                         ["Commercial value / yr", `${fmtMoney(valuePerYear)}`, "#76FF03"],
@@ -2536,17 +2556,17 @@ export default function App() {
                         <div key={k} style={{ padding: "7px 10px", background: "rgba(70,255,100,0.04)", border: "1px solid rgba(70,255,100,0.12)", borderRadius: 4 }}>
                           <div style={{ fontSize: 7, color: "#2a5a40", letterSpacing: 1, marginBottom: 3 }}>{k.toUpperCase()}</div>
                           <div style={{ fontSize: 13, color: c, fontWeight: 700 }}>{v}</div>
-                          <div style={{ fontSize: 8, color: "#2a4a30", marginTop: 1 }}>@ ${commercialRate}/km²</div>
+                          <div style={{ fontSize: 8, color: "#2a4a30", marginTop: 1 }}>@ ${commercialRate}/km² · net (cloud-free)</div>
                         </div>
                       ))}
                     </div>
 
                     {/* Per-country breakdown */}
-                    <div style={{ fontSize: 7, color: "#2a4060", letterSpacing: 1, marginBottom: 5 }}>PER-COUNTRY IMAGERY</div>
+                    <div style={{ fontSize: 7, color: "#2a4060", letterSpacing: 1, marginBottom: 5 }}>PER-COUNTRY IMAGERY (GROSS → NET)</div>
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
                       <thead>
                         <tr style={{ borderBottom: "1px solid rgba(70,140,200,0.12)" }}>
-                          {["Country", "Passes/30d", "Avg track", "km²/yr", "Value/yr", "Share"].map((h, hi) => (
+                          {["Country", "Passes/30d", "Avg track", "Gross km²/yr", "Cloud", "Net km²/yr", "Value/yr (net)", "Share"].map((h, hi) => (
                             <th key={hi} style={{ padding: "3px 6px", textAlign: hi === 0 ? "left" : "right", color: "#2a5068", fontSize: 7, letterSpacing: 0.7, fontWeight: 600 }}>{h.toUpperCase()}</th>
                           ))}
                         </tr>
@@ -2554,15 +2574,19 @@ export default function App() {
                       <tbody>
                         {satResults.map((r, ri) => {
                           const passesPerYear = (r.sunlitPassCountByTf[30] || 0) * (365.25 / 30);
-                          const annualKm2 = passesPerYear * r.avgSunlitPassLengthKm * r.swKm;
-                          const annualValue = annualKm2 * commercialRate;
-                          const share = imgPerYear > 0 ? (annualKm2 / imgPerYear * 100) : 0;
+                          const grossAnnualKm2 = passesPerYear * r.avgSunlitPassLengthKm * r.swKm;
+                          const cldFrac = (r.cloudPct || 50) / 100;
+                          const netAnnualKm2 = grossAnnualKm2 * (1 - cldFrac);
+                          const annualValue = netAnnualKm2 * commercialRate;
+                          const share = netImgPerYear > 0 ? (netAnnualKm2 / netImgPerYear * 100) : 0;
                           return (
                             <tr key={ri} style={{ borderBottom: "1px solid rgba(70,140,200,0.04)" }}>
                               <td style={{ padding: "5px 6px", color: "#80a8c0", fontWeight: 600 }}>{r.countryName}</td>
                               <td style={{ padding: "5px 6px", textAlign: "right", color: "#a0d0e8" }}>{r.sunlitPassCountByTf[30] || 0}</td>
                               <td style={{ padding: "5px 6px", textAlign: "right", color: "#a0d0e8" }}>{r.avgSunlitPassLengthKm.toFixed(0)} km</td>
-                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#FFD740" }}>{fmt(annualKm2)} km²</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#506878" }}>{fmt(grossAnnualKm2)} km²</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#7090a0" }}>{r.cloudPct}%</td>
+                              <td style={{ padding: "5px 6px", textAlign: "right", color: "#FFD740" }}>{fmt(netAnnualKm2)} km²</td>
                               <td style={{ padding: "5px 6px", textAlign: "right", color: "#76FF03" }}>{fmtMoney(annualValue)}</td>
                               <td style={{ padding: "5px 6px", textAlign: "right" }}>
                                 <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }}>
