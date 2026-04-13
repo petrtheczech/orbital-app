@@ -103,8 +103,10 @@ function constellationTrack(sat, numOrbits, ptsPerOrbit) {
 /* Module-level cache: avoids re-running the expensive search across renders */
 const _raanCache = new Map();
 
-/* Compute optimal RAAN so the earliest SUNLIT pass crosses the anchor country.
-   Two-stage search: coarse (36 candidates × 5-day track) then fine (±9° × 5-day).
+/* Compute optimal RAAN by longitude-matching: shift the orbit so its first ascending
+   node crossing at the target latitude aligns with the anchor country's centre longitude.
+   This guarantees the first pass is within ~1 orbit period (~1 hr for LEO) for all
+   inclinations. Sunlit timing varies by orbit type and is visible in the revisit table.
    Results are cached by sat fingerprint + country id so subsequent calls are O(1). */
 function computeOptimalRaan(sat, anchorCty) {
   const key = `${sat.altitude}|${sat.inclination}|${sat.eccentricity||0}|${sat.swathAngle||10}|${anchorCty.id}`;
@@ -112,62 +114,18 @@ function computeOptimalRaan(sat, anchorCty) {
 
   const targetLon = (anchorCty.lonMin + anchorCty.lonMax) / 2;
   const targetLat = (anchorCty.latMin + anchorCty.latMax) / 2;
-  const T = orbPeriod(sat.altitude);
-  const swDeg = effSwathKm(sat.altitude, sat.swathAngle || 10) / (2 * Math.PI * R_E) * 360;
-  const latBuf = swDeg / 2 + 0.8, lonBuf = 1.5;
-  const nOrbits5 = Math.ceil(86400 / T * 5);
-
-  function firstSunlitDay(testRaan) {
-    const testSat = { ...sat, raan: testRaan, eccentricity: sat.eccentricity || 0, count: 1 };
-    const pts = groundTrack(testSat, nOrbits5, 300);
-    // For each buffer-zone pass, find the point closest to (targetLat, targetLon).
-    // Return the closest-approach time if sunlit — ensures RAAN centers the orbit over
-    // the country, not just the buffer edge (critical for equatorial orbits).
-    let inPass = false, closestDist = Infinity, closestT = Infinity;
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      const over = p.lat >= anchorCty.latMin - latBuf && p.lat <= anchorCty.latMax + latBuf &&
-                   p.lon >= anchorCty.lonMin - lonBuf && p.lon <= anchorCty.lonMax + lonBuf;
-      if (over) {
-        const dLat = (p.lat - targetLat) * 111.32;
-        const dLon = (p.lon - targetLon) * 111.32 * Math.cos(targetLat * DEG);
-        const dist = Math.sqrt(dLat * dLat + dLon * dLon);
-        if (dist < closestDist) { closestDist = dist; closestT = p.t; }
-        inPass = true;
-      } else if (inPass) {
-        if (isInImagingWindow(closestT, targetLat, targetLon)) return closestT / 86400;
-        inPass = false; closestDist = Infinity; closestT = Infinity;
+  const testPts = groundTrack({ ...sat, raan: 0, eccentricity: sat.eccentricity || 0, count: 1 }, 1, 2000);
+  let bestShift = 0, bestErr = 999;
+  for (let i = 0; i < testPts.length; i++) {
+    if (Math.abs(testPts[i].lat - targetLat) < 3) {
+      const err = Math.abs(testPts[i].lat - targetLat);
+      if (err < bestErr) {
+        bestErr = err;
+        bestShift = targetLon - testPts[i].lon;
       }
     }
-    if (inPass && isInImagingWindow(closestT, targetLat, targetLon)) return closestT / 86400;
-    return Infinity;
   }
-
-  // Stage 1: coarse sweep every 10° (36 candidates)
-  let bestRaan = 0, bestDay = Infinity;
-  for (let r = 0; r < 360; r += 10) {
-    const d = firstSunlitDay(r);
-    if (d < bestDay) { bestDay = d; bestRaan = r; }
-  }
-
-  // Stage 2: fine sweep ±9° around best coarse result (19 candidates at 1° step)
-  for (let delta = -9; delta <= 9; delta++) {
-    const r = ((bestRaan + delta) % 360 + 360) % 360;
-    const d = firstSunlitDay(r);
-    if (d < bestDay) { bestDay = d; bestRaan = r; }
-  }
-
-  // Fallback: no sunlit pass found in 5 days — align by longitude geometry
-  if (bestDay === Infinity) {
-    const pts = groundTrack({ ...sat, raan: 0, eccentricity: sat.eccentricity || 0, count: 1 }, 1, 2000);
-    let best = 0, bestErr = 999;
-    for (const p of pts) {
-      const err = Math.abs(p.lat - targetLat);
-      if (err < 3 && err < bestErr) { bestErr = err; best = targetLon - p.lon; }
-    }
-    bestRaan = ((best % 360) + 360) % 360;
-  }
-
+  const bestRaan = ((bestShift % 360) + 360) % 360;
   _raanCache.set(key, bestRaan);
   return bestRaan;
 }
@@ -1139,7 +1097,7 @@ export default function App() {
     const result = {};
     for (const sat of sats) {
       const effSat = satWithAnchorRaan(sat, anchorObj);
-      const { passes } = computePasses(effSat, anchorObj, 5); // 5 days: handles slow sunlit optimization
+      const { passes } = computePasses(effSat, anchorObj, 5); // 5 days: first pass is within hours, ample window
       // Use the mid-indexed point of the first pass — matches computePasses passMidTimes formula
       result[sat.id] = passes.length > 0 ? passes[0][Math.floor(passes[0].length / 2)].t : 0;
     }
