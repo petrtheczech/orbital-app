@@ -363,17 +363,12 @@ function computePasses(sat, cty, numDays, startT = 0) {
   const T = orbPeriod(sat.altitude);
   const totalDays = startT / 86400 + numDays;
   const nOrbits = Math.ceil((86400 / T) * totalDays);
-  
-  // Adaptive ppo: satellite traverses ~2*inclination degrees of latitude per orbit.
-  // For small countries, we need enough points so that passes aren't skipped.
-  // Require at least 4 points within the country's latitude span per orbit.
-  const latSpan = cty.latMax - cty.latMin;
-  const fullLatTraverse = 2 * Math.min(sat.inclination, 180 - sat.inclination);
-  const minPpoForSize = Math.ceil((fullLatTraverse / Math.max(latSpan, 0.5)) * 4);
-  const ppo = Math.max(minPpoForSize, 500);
-  // Cap total points at 500k for performance
-  const safePpo = nOrbits * ppo > 500000 ? Math.max(500, Math.round(500000 / nOrbits)) : ppo;
-  const pts = constellationTrack(sat, nOrbits, safePpo);
+  // Fixed ppo=500: must not vary with timeframe so track points for day 0-N are
+  // identical whether you're viewing 1 day or 30 days. Adaptive or capped ppo
+  // causes different sampling → different detected passes → tracks "disappear".
+  // With TRACK_TF_OPTS max=30d and ~16 orbits/day, worst case = 480×500 = 240k pts.
+  const ppo = 500;
+  const pts = constellationTrack(sat, nOrbits, ppo);
 
   const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
   const swDegLat = (sw / (2 * Math.PI * R_E)) * 360;
@@ -1212,12 +1207,10 @@ export default function App() {
           // the selected analysis timeframe. Without this, choosing tf=7 would make
           // the 30-day columns equal to the 7-day columns.
           const nOrbits30 = Math.ceil((86400 / T) * Math.max(tf, 30));
-          const latSpanCty = cty.latMax - cty.latMin;
-          const fullLat = 2 * Math.min(effectiveSat.inclination, 180 - effectiveSat.inclination);
-          const minPpo = Math.ceil((fullLat / Math.max(latSpanCty, 0.5)) * 4);
-          const ppo = Math.max(minPpo, 500);
-          const safePpo = nOrbits30 * ppo > 500000 ? Math.max(500, Math.round(500000 / nOrbits30)) : ppo;
-          const trackPts = constellationTrack(effectiveSat, nOrbits30, safePpo);
+          // Fixed ppo=500: matches computePasses so pass detection is consistent
+          // with what the map shows. Adaptive ppo caused different sampling per
+          // timeframe which made passes appear/disappear across timeframe views.
+          const trackPts = constellationTrack(effectiveSat, nOrbits30, 500);
 
           // ── Count passes per timeframe bucket ──
           const passBuckets = [1, 3, 5, 7, 14, 30];
