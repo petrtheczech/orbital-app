@@ -1606,7 +1606,7 @@ export default function App() {
       });
 
       // ── UTILIZATION TABLE (satellite summary + per-country breakdown) ──
-      const utilHdr = mkHdr(["Satellite / Country", "Avg Daily Demand", "Max Daily Potential", "Daily Capacity", "Utilization", "Headroom", "Actual km²/yr", "Passes/30d", "km²/pass", "Demand Share"]);
+      const utilHdr = mkHdr(["Satellite / Country", "Avg Daily Demand", "Max Daily Potential", "Daily Capacity", "Utilization", "Headroom", "Actual km²/yr", "Lifetime km²", "Passes/30d", "km²/pass", "Demand Share"]);
       const utilRows = sats.flatMap(sat => {
         const satResults = (results || []).filter(r => r.satId === sat.id);
         if (!satResults.length) return [];
@@ -1616,6 +1616,8 @@ export default function App() {
         const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
         const headroom = dailyCap > 0 ? dailyCap - totalUncappedDaily : null;
         const actualPerYear = effectiveDaily * 365.25;
+        const satLifetime = satResults[0].satLifetime || 5;
+        const actualLifetime = actualPerYear * satLifetime;
         // Max daily potential: peak single-day total across all countries
         const dayTotals = new Float64Array(30);
         for (const r of satResults) {
@@ -1633,6 +1635,7 @@ export default function App() {
           mkCell(utilization !== null ? `${utilization.toFixed(0)}%` : "—", true, true),
           mkCell(headroom !== null ? `${headroom >= 0 ? "+" : "−"}${fmtN(Math.abs(headroom))} km²/d` : "—", true, true),
           mkCell(`${fmtN(actualPerYear)} km²`, true, true),
+          mkCell(`${fmtN(actualLifetime)} km² (${satLifetime}yr)`, true, true),
           mkCell("", false, true),
           mkCell("", false, true),
           mkCell("", false, true),
@@ -1645,6 +1648,7 @@ export default function App() {
           return new TableRow({ children: [
             mkCell(`  → ${r.countryName}`),
             mkCell(`${fmtN(dailyDemand)} km²/d`, false, true),
+            mkCell("—", false, true),
             mkCell("—", false, true),
             mkCell("—", false, true),
             mkCell("—", false, true),
