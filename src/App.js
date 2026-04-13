@@ -464,7 +464,7 @@ function computePasses(sat, cty, numDays, startT = 0) {
    Replicates the full CountryTrackMap appearance: tiles → country border → swath
    bands → track lines → info badges. Uses crossOrigin="anonymous" so OSM tiles
    (which serve Access-Control-Allow-Origin: *) can be drawn to a readable canvas. */
-async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, W = 600, H = 480) {
+async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, W = 600, H = 480, allCountries = null) {
   const { passPolys, passes, passMidTimes, passLengthsKm } = computePasses(sat, cty, tfDays, anchorOffset);
   const midLat = (cty.latMin + cty.latMax) / 2;
   const midLon = (cty.lonMin + cty.lonMax) / 2;
@@ -545,27 +545,30 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
   }
   ctx.restore();
 
-  // ── Country border ──
-  const bdr = BORDERS[cty.id];
-  ctx.save();
-  ctx.beginPath();
-  if (bdr && bdr.length > 0) {
-    bdr.forEach(([lo, la], i) => { if (i === 0) ctx.moveTo(tX(lo), tY(la)); else ctx.lineTo(tX(lo), tY(la)); });
-    ctx.closePath();
-  } else {
-    ctx.rect(tX(cty.lonMin), tY(cty.latMax), tX(cty.lonMax) - tX(cty.lonMin), tY(cty.latMin) - tY(cty.latMax));
+  // ── Country border(s) — draw each country separately in combined view ──
+  const drawCtys = allCountries || [cty];
+  for (const ct of drawCtys) {
+    const bdr = BORDERS[ct.id];
+    ctx.save();
+    ctx.beginPath();
+    if (bdr && bdr.length > 0) {
+      bdr.forEach(([lo, la], i) => { if (i === 0) ctx.moveTo(tX(lo), tY(la)); else ctx.lineTo(tX(lo), tY(la)); });
+      ctx.closePath();
+    } else {
+      ctx.rect(tX(ct.lonMin), tY(ct.latMax), tX(ct.lonMax) - tX(ct.lonMin), tY(ct.latMin) - tY(ct.latMax));
+    }
+    ctx.fillStyle = 'rgba(120,175,100,0.15)';
+    ctx.fill();
+    ctx.setLineDash([8, 4]);
+    ctx.strokeStyle = '#2a6020';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = '#1a5018';
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.restore();
   }
-  ctx.fillStyle = 'rgba(120,175,100,0.15)';
-  ctx.fill();
-  ctx.setLineDash([8, 4]);
-  ctx.strokeStyle = '#2a6020';
-  ctx.lineWidth = 2.5;
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.strokeStyle = '#1a5018';
-  ctx.lineWidth = 2.5;
-  ctx.stroke();
-  ctx.restore();
 
   // ── Track center lines (no swath corridor — only nadir track lines) ──
   ctx.save();
@@ -737,19 +740,34 @@ function useMapImage(cty, svgW, svgH) {
   return imgSrc;
 }
 
-function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height = 440 }) {
+function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height = 440, extraCountries = null, anchorCtyId = null }) {
   const [tfIdx, setTfIdx] = useState(2);
   const [sunlitOnly, setSunlitOnly] = useState(false);
   const tfDays = TRACK_TF_OPTS[tfIdx].d;
 
+  // Combined view: merge all countries into a single bounding box used for
+  // viewport, map background, and pass detection. Individual borders are
+  // still drawn separately for clarity.
+  const drawCountries = extraCountries ? [country, ...extraCountries] : [country];
+  const cty = extraCountries ? {
+    id: drawCountries.map(c => c.id).sort().join('+'),
+    name: drawCountries.map(c => c.name).join(' + '),
+    latMin: Math.min(...drawCountries.map(c => c.latMin)),
+    latMax: Math.max(...drawCountries.map(c => c.latMax)),
+    lonMin: Math.min(...drawCountries.map(c => c.lonMin)),
+    lonMax: Math.max(...drawCountries.map(c => c.lonMax)),
+    area: drawCountries.reduce((s, c) => s + c.area, 0),
+  } : country;
+
   const { passPolys, covPct, passes, passMidTimes, passLengthsKm } = useMemo(
-    () => computePasses(sat, country, tfDays, anchorOffset),
+    () => computePasses(sat, cty, tfDays, anchorOffset),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [sat.altitude, sat.inclination, sat.eccentricity, sat.raan, sat.argPerigee,
-     sat.swathAngle, sat.offNadir, country.id, tfDays, anchorOffset]
+     sat.swathAngle, sat.offNadir, cty.id, tfDays, anchorOffset]
   );
 
-  const midLat = (country.latMin + country.latMax) / 2;
-  const midLon = (country.lonMin + country.lonMax) / 2;
+  const midLat = (cty.latMin + cty.latMax) / 2;
+  const midLon = (cty.lonMin + cty.lonMax) / 2;
   const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
   // visiblePasses used for badge count only
   const visiblePasses = sunlitOnly
@@ -763,7 +781,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
   const covKm2 = dailyCap > 0 ? Math.min(uncappedCovKm2, dailyCap * tfDays) : uncappedCovKm2;
   const fmtKm2 = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(1)}k` : v.toFixed(0);
 
-  const cty = country;
+  // cty is already set above (either combined bounds or single country)
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
   const margin = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
   const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
@@ -783,12 +801,6 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
 
   // Get real map background
   const mapImg = useMapImage(cty, svgW, svgH);
-
-  // Country border
-  const bdr = BORDERS[cty.id];
-  const bdrPath = bdr
-    ? bdr.map(([lo, la]) => `${tX(lo).toFixed(1)},${tY(la).toFixed(1)}`).join(" ")
-    : `${tX(cty.lonMin)},${tY(cty.latMax)} ${tX(cty.lonMax)},${tY(cty.latMax)} ${tX(cty.lonMax)},${tY(cty.latMin)} ${tX(cty.lonMin)},${tY(cty.latMin)}`;
 
   // Grid
   const gStep = dLat > 15 ? 5 : dLat > 5 ? 2 : dLat > 2 ? 1 : 0.5;
@@ -824,7 +836,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
 
           {/* Explicit clip region — ensures swath polygons never expand layout */}
           <defs>
-            <clipPath id={`vp-${cty.id}`}>
+            <clipPath id={`vp-${cty.id.replace(/[^a-zA-Z0-9]/g, '-')}`}>
               <rect x="0" y="0" width={svgW} height={svgH} />
             </clipPath>
           </defs>
@@ -852,11 +864,20 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
             </g>
           ))}
 
-          {/* Country border fill */}
-          <polygon points={bdrPath} fill={mapImg ? "rgba(120,175,100,0.15)" : "rgba(120,175,100,0.45)"} stroke="#2a6020" strokeWidth="2.5" strokeDasharray="8,4" />
+          {/* Country border fills — each country individually, anchor highlighted */}
+          {drawCountries.map(ct => {
+            const b = BORDERS[ct.id];
+            const pts = b
+              ? b.map(([lo, la]) => `${tX(lo).toFixed(1)},${tY(la).toFixed(1)}`).join(" ")
+              : `${tX(ct.lonMin)},${tY(ct.latMax)} ${tX(ct.lonMax)},${tY(ct.latMax)} ${tX(ct.lonMax)},${tY(ct.latMin)} ${tX(ct.lonMin)},${tY(ct.latMin)}`;
+            const isAnch = ct.id === anchorCtyId;
+            return <polygon key={`fill-${ct.id}`} points={pts}
+              fill={mapImg ? (isAnch ? "rgba(255,179,0,0.2)" : "rgba(120,175,100,0.15)") : (isAnch ? "rgba(255,179,0,0.4)" : "rgba(120,175,100,0.45)")}
+              stroke={isAnch ? "#FFB300" : "#2a6020"} strokeWidth="2.5" strokeDasharray="8,4" />;
+          })}
 
           {/* Track lines — clipped to viewport, sunlit filter applied per-pass */}
-          <g clipPath={`url(#vp-${cty.id})`}>
+          <g clipPath={`url(#vp-${cty.id.replace(/[^a-zA-Z0-9]/g, '-')})`}>
             {passPolys.map((poly, pi) => {
               if (sunlitOnly && !isInImagingWindow(passMidTimes[pi], midLat, midLon)) return null;
               if (poly.center.length < 2) return null;
@@ -871,8 +892,16 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
             })}
           </g>
 
-          {/* Country border top */}
-          <polygon points={bdrPath} fill="none" stroke="#1a5018" strokeWidth="2.5" />
+          {/* Country border outlines on top */}
+          {drawCountries.map(ct => {
+            const b = BORDERS[ct.id];
+            const pts = b
+              ? b.map(([lo, la]) => `${tX(lo).toFixed(1)},${tY(la).toFixed(1)}`).join(" ")
+              : `${tX(ct.lonMin)},${tY(ct.latMax)} ${tX(ct.lonMax)},${tY(ct.latMax)} ${tX(ct.lonMax)},${tY(ct.latMin)} ${tX(ct.lonMin)},${tY(ct.latMin)}`;
+            const isAnch = ct.id === anchorCtyId;
+            return <polygon key={`top-${ct.id}`} points={pts}
+              fill="none" stroke={isAnch ? "#FFB300" : "#1a5018"} strokeWidth="2.5" />;
+          })}
         </svg>
 
         {/* Info overlay */}
@@ -888,7 +917,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
           </div>
           {covKm2 > 0 && (
             <div style={{ marginTop: 4, fontSize: 9, fontFamily: "'IBM Plex Mono',monospace", color: "#64FFDA", fontWeight: 600 }}>
-              ☀ {fmtKm2(covKm2)} km² imaged / {fmtKm2(country.area)} km²
+              ☀ {fmtKm2(covKm2)} km² imaged / {fmtKm2(cty.area)} km²
               {dailyCap > 0 && uncappedCovKm2 > dailyCap * tfDays && (
                 <span style={{ color: "#FFB300", fontSize: 8, marginLeft: 4 }}>(cap {fmtKm2(dailyCap * tfDays)})</span>
               )}
@@ -1067,7 +1096,29 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const mainRef = useRef(null);
   const selCtyObjs = COUNTRIES.filter(c => selCtys.includes(c.id));
+  const [combinedView, setCombinedView] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
+
+  // Combined bounds: merge all selected countries into one bounding box
+  const combinedBounds = useMemo(() => {
+    if (selCtyObjs.length < 2) return null;
+    return {
+      id: selCtyObjs.map(c => c.id).sort().join('+'),
+      name: selCtyObjs.map(c => c.name).join(' + '),
+      latMin: Math.min(...selCtyObjs.map(c => c.latMin)),
+      latMax: Math.max(...selCtyObjs.map(c => c.latMax)),
+      lonMin: Math.min(...selCtyObjs.map(c => c.lonMin)),
+      lonMax: Math.max(...selCtyObjs.map(c => c.lonMax)),
+      area: selCtyObjs.reduce((s, c) => s + c.area, 0),
+    };
+  }, [selCtyObjs]);
+  const combinedViewValid = Boolean(
+    combinedBounds &&
+    combinedBounds.latMax - combinedBounds.latMin <= 15 &&
+    combinedBounds.lonMax - combinedBounds.lonMin <= 15
+  );
+  // Auto-reset combined view when it becomes invalid (e.g. countries deselected)
+  useEffect(() => { if (!combinedViewValid) setCombinedView(false); }, [combinedViewValid]);
   const [commercialRate, setCommercialRate] = useState(15); // €/km²
   const [form, setForm] = useState({
     name: "", altitude: 500, inclination: 97.4, eccentricity: 0.001,
@@ -1658,6 +1709,7 @@ export default function App() {
       // comparison collages. Avoids duplicate OSM tile loads.
       const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
       const mapCache = new Map(); // key: `${sat.id}|${cty.id}|${d}|${sunlit}`
+      // Individual per-country maps (always needed for Section 1 detail grid)
       for (const sat of sats) {
         const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
         const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
@@ -1672,7 +1724,23 @@ export default function App() {
           );
         }
       }
+      // Combined view maps (when active: one combined map per sat × timeframe × mode)
+      if (combinedView && combinedBounds) {
+        for (const sat of sats) {
+          const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+          const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
+          await Promise.all(
+            TRACK_TF_OPTS.flatMap(({ d }) =>
+              [false, true].map(async (sunlit) => {
+                const url = await renderTrackMapToDataURL(effSat, combinedBounds, anchorOffset, d, sunlit, 600, 480, selCtyObjs);
+                mapCache.set(`${sat.id}|__combined__|${d}|${sunlit}`, url ? dataUrlToUint8Array(url) : null);
+              })
+            )
+          );
+        }
+      }
       const getMap = (satId, ctyId, d, sunlit) => mapCache.get(`${satId}|${ctyId}|${d}|${sunlit}`) ?? null;
+      const getCombinedMap = (satId, d, sunlit) => mapCache.get(`${satId}|__combined__|${d}|${sunlit}`) ?? null;
 
       // ── SECTION 1: per-satellite detail grid (ALL | SUNLIT side-by-side per timeframe) ──
       const IMG_W = 440, IMG_H = 352;
@@ -1747,9 +1815,10 @@ export default function App() {
       });
 
       const collageChildren = [];
-      for (const cty of selCtyObjs) {
+      if (combinedView && combinedBounds) {
+        // Combined View: one collage per mode using the merged country viewport
         for (const [sunlit, modeLabel] of [[false, "ALL PASSES"], [true, "SUNLIT PASSES"]]) {
-          const collTitle = `Coverage Comparison — ${modeLabel} — ${cty.name}`;
+          const collTitle = `Coverage Comparison — ${modeLabel} — ${combinedBounds.name}`;
           collageChildren.push(new Paragraph({
             children: [new TextRun({ text: collTitle, bold: true, size: 28 })],
             pageBreakBefore: true,
@@ -1765,13 +1834,42 @@ export default function App() {
           const dataRows = TRACK_TF_OPTS.map(({ l, d }) =>
             new TableRow({ children: [
               mkCLbl(l),
-              ...sats.map(sat => mkCImg(getMap(sat.id, cty.id, d, sunlit), imgPct)),
+              ...sats.map(sat => mkCImg(getCombinedMap(sat.id, d, sunlit), imgPct)),
             ]})
           );
           collageChildren.push(new Table({
             width: { size: 100, type: WidthType.PERCENTAGE },
             rows: [headerRow, ...dataRows],
           }));
+        }
+      } else {
+        // Individual View: one collage per country per mode
+        for (const cty of selCtyObjs) {
+          for (const [sunlit, modeLabel] of [[false, "ALL PASSES"], [true, "SUNLIT PASSES"]]) {
+            const collTitle = `Coverage Comparison — ${modeLabel} — ${cty.name}`;
+            collageChildren.push(new Paragraph({
+              children: [new TextRun({ text: collTitle, bold: true, size: 28 })],
+              pageBreakBefore: true,
+              spacing: { after: 200 },
+            }));
+            const headerRow = new TableRow({ children: [
+              mkCHdr("", labelPct),
+              ...sats.map(sat => {
+                const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+                return mkCHdr(`${sat.name}\n${effSat.altitude}km · ${effSat.inclination}°`, imgPct);
+              }),
+            ]});
+            const dataRows = TRACK_TF_OPTS.map(({ l, d }) =>
+              new TableRow({ children: [
+                mkCLbl(l),
+                ...sats.map(sat => mkCImg(getMap(sat.id, cty.id, d, sunlit), imgPct)),
+              ]})
+            );
+            collageChildren.push(new Table({
+              width: { size: 100, type: WidthType.PERCENTAGE },
+              rows: [headerRow, ...dataRows],
+            }));
+          }
         }
       }
 
@@ -1806,7 +1904,7 @@ export default function App() {
       saveAs(blob, "orbital-coverage-analysis.docx");
     } catch (e) { console.error("Word export error:", e); }
     setExporting(false);
-  }, [results, sats, tf, commercialRate, anchorCty, anchorFirstPassTimes, selCtyObjs]);
+  }, [results, sats, tf, commercialRate, anchorCty, anchorFirstPassTimes, selCtyObjs, combinedView, combinedBounds]);
 
   const tfOpts = [{ l: "1 Day", v: 1 }, { l: "3 Days", v: 3 }, { l: "7 Days", v: 7 }, { l: "16 Days", v: 16 }, { l: "30 Days", v: 30 }, { l: "90 Days", v: 90 }, { l: "1 Year", v: 365 }];
 
@@ -2035,6 +2133,31 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              {/* Combined View toggle — only shown when ≥2 countries are selected */}
+              {selCtyObjs.length >= 2 && (
+                <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+                  {[["Individual Maps", false], ["Combined View", true]].map(([label, val]) => {
+                    const disabled = val && !combinedViewValid;
+                    return (
+                      <button key={String(val)}
+                        onClick={() => { if (!disabled) setCombinedView(val); }}
+                        title={disabled ? "Countries too far apart for combined view (>15° span)" : ""}
+                        style={{
+                          flex: 1, padding: "5px 4px", borderRadius: 4,
+                          cursor: disabled ? "not-allowed" : "pointer",
+                          background: combinedView === val && !disabled
+                            ? "rgba(100,255,218,0.14)" : "rgba(70,140,200,0.04)",
+                          border: `1px solid ${combinedView === val && !disabled
+                            ? "rgba(100,255,218,0.4)" : "rgba(70,140,200,0.15)"}`,
+                          color: disabled ? "#2a4050" : combinedView === val ? "#64FFDA" : "#3a7090",
+                          fontSize: 8, fontFamily: "inherit", letterSpacing: 0.5, fontWeight: combinedView === val ? 700 : 400,
+                          opacity: disabled ? 0.45 : 1, transition: "all 0.15s",
+                        }}>{label}</button>
+                    );
+                  })}
+                </div>
+              )}
 
               <Lbl>SELECTED ({selCtys.length})</Lbl>
               {selCtyObjs.map(c => {
@@ -2319,20 +2442,40 @@ export default function App() {
                 Zoomed maps showing full ground track lines over each target country. Use the timeframe buttons below each map to see track buildup over 1 day → 30 days. Green cells = covered area.
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8 }}>
-                {sats.map(sat => {
-                  const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
-                  const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
-                  const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
-                  return selCtyObjs.map(cty => (
-                    <CountryTrackMap
-                      key={`${sat.id}-${cty.id}-${anchorCty || ''}`}
-                      country={cty}
-                      sat={effSat}
-                      anchorOffset={anchorOffset}
-                      width={500} height={440}
-                    />
-                  ));
-                })}
+                {combinedView && combinedViewValid ? (
+                  sats.map(sat => {
+                    const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
+                    const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+                    const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
+                    const [first, ...rest] = selCtyObjs;
+                    return (
+                      <CountryTrackMap
+                        key={`${sat.id}-combined-${anchorCty || ''}`}
+                        country={first}
+                        extraCountries={rest}
+                        anchorCtyId={anchorCty}
+                        sat={effSat}
+                        anchorOffset={anchorOffset}
+                        width={900} height={700}
+                      />
+                    );
+                  })
+                ) : (
+                  sats.map(sat => {
+                    const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
+                    const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+                    const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
+                    return selCtyObjs.map(cty => (
+                      <CountryTrackMap
+                        key={`${sat.id}-${cty.id}-${anchorCty || ''}`}
+                        country={cty}
+                        sat={effSat}
+                        anchorOffset={anchorOffset}
+                        width={500} height={440}
+                      />
+                    ));
+                  })
+                )}
               </div>
             </P>
 
