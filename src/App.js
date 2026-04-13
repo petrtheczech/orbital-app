@@ -1539,7 +1539,7 @@ export default function App() {
       const mkHdr = (cols) => new TableRow({ children: cols.map(h => mkCell(h, true, true)) });
 
       // ── REVISIT ANALYSIS TABLE ──
-      const revisitHdr = mkHdr(["Satellite → Country", "Mode", "First Pass", "Mean Revisit", "Max Gap", "100% Coverage", "First View", "100% Mapped", "1d", "3d", "5d", "7d", "14d", "30d"]);
+      const revisitHdr = mkHdr(["Satellite → Country", "Mode", "Mean Revisit", "Max Gap", "First Sunlit", "100% Mapped", "1d", "3d", "5d", "7d", "14d", "30d"]);
       const revisitRows = (results || []).flatMap(r => {
         const pc = r.passCountByTf || {}, spc = r.sunlitPassCountByTf || {};
         const fmtDw = (d) => {
@@ -1553,22 +1553,18 @@ export default function App() {
           new TableRow({ children: [
             mkCell(`${r.satName} → ${r.countryName}`, true),
             mkCell("ALL"),
-            mkCell(fmtD(r.firstAllPassDay), false, true),
             mkCell(fmtD(r.meanRevisitDays), false, true),
             mkCell(fmtD(r.maxGapDays), false, true),
-            mkCell(r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`, false, true),
-            mkCell(fmtDw(r.firstViewAllDay) + (r.firstViewAllCloud ? ` / ${fmtDw(r.firstViewAllCloud)} ☁` : ""), false, true),
-            mkCell(fmtDw(r.hundredPctMappedAllDays) + (r.hundredPctMappedAllCloud ? ` / ${fmtDw(r.hundredPctMappedAllCloud)} ☁` : "") + (r.offNadirNote ? " (nadir)" : ""), false, true),
+            mkCell("—", false, true),
+            mkCell("—", false, true),
             ...[1,3,5,7,14,30].map(b => mkCell(String(pc[b]||0), false, true)),
           ]}),
           new TableRow({ children: [
             mkCell(""),
             mkCell("Sunlit OPT"),
-            mkCell(fmtD(r.firstSunlitPassDay), false, true),
             mkCell(fmtD(r.sunlitMeanRevisitDays), false, true),
             mkCell(fmtD(r.sunlitMaxGapDays), false, true),
-            mkCell("—", false, true),
-            mkCell(fmtDw(r.firstViewSunlitDay) + (r.firstViewSunlitCloud ? ` / ${fmtDw(r.firstViewSunlitCloud)} ☁${r.cloudPct}%` : ""), false, true),
+            mkCell(fmtDw(r.firstSunlitPassDay), false, true),
             mkCell(fmtDw(r.hundredPctMappedSunlitDays) + (r.hundredPctMappedSunlitCloud ? ` / ${fmtDw(r.hundredPctMappedSunlitCloud)} ☁` : "") + (r.offNadirNote ? " (nadir)" : ""), false, true),
             ...[1,3,5,7,14,30].map(b => mkCell(String(spc[b]||0), false, true)),
           ]}),
@@ -2129,11 +2125,9 @@ export default function App() {
                       {[
                         { label: "Satellite → Country", center: false },
                         { label: "Mode", center: false },
-                        { label: "First\nPass", center: true },
                         { label: "Mean\nRevisit", center: true },
                         { label: "Max\nGap", center: true },
-                        { label: "100%\nCoverage", center: true },
-                        { label: "First\nView", center: true },
+                        { label: "First\nSunlit", center: true },
                         { label: "100%\nMapped", center: true },
                         { label: "1d\npasses", center: true, sep: true },
                         { label: "3d\npasses", center: true },
@@ -2145,7 +2139,7 @@ export default function App() {
                         <th key={i} style={{
                           textAlign: h.center ? "center" : "left",
                           padding: "7px 6px",
-                          color: h.sep ? "#4a8898" : i < 8 ? "#2a5a78" : "#4a8898",
+                          color: h.sep ? "#4a8898" : i < 6 ? "#2a5a78" : "#4a8898",
                           fontWeight: 600, fontSize: 8, letterSpacing: 0.8,
                           whiteSpace: "pre-line", verticalAlign: "bottom",
                           borderLeft: h.sep ? "1px solid rgba(70,140,200,0.12)" : "none"
@@ -2173,19 +2167,10 @@ export default function App() {
                             <span style={{ color: "#80a8c0" }}>{r.countryName}</span>
                           </td>
                           <td style={{ padding: "6px 6px", fontSize: 8, color: "#4a7890", fontWeight: 600, whiteSpace: "nowrap" }}>ALL</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#64FFDA", fontWeight: 700 }}>{fmtD(r.firstAllPassDay)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#a0d0e8" }}>{fmtD(r.meanRevisitDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFD740" }}>{fmtD(r.maxGapDays)}</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: r.fullCovDay !== null ? "#64FFDA" : "#FF8A80" }}>{r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`}</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#64c8e8", fontWeight: 600, lineHeight: 1.4 }}>
-                            <div>{fmtD(r.firstViewAllDay)}</div>
-                            {r.firstViewAllCloud !== null && <div style={{ fontSize: 8, color: "#7090a0", fontWeight: 400 }}>{fmtD(r.firstViewAllCloud)} ☁</div>}
-                          </td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a6a80", fontSize: 9, lineHeight: 1.4 }}>
-                            <div>{fmtD(r.hundredPctMappedAllDays)}</div>
-                            {r.hundredPctMappedAllCloud !== null && <div style={{ fontSize: 8, color: "#7090a0" }}>{fmtD(r.hundredPctMappedAllCloud)} ☁</div>}
-                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#3a5060" }}>nadir only</div>}
-                          </td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#3a4a58" }}>—</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#3a4a58" }}>—</td>
                           {[1,3,5,7,14,30].map((b, bi) => (
                             <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: bi === 0 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (pc[b] || 0) === 0 ? "#3a4a58" : (pc[b] || 0) >= 5 ? "#64FFDA" : "#a0d0e8" }}>
                               {pc[b] || 0}
@@ -2195,14 +2180,9 @@ export default function App() {
                         <tr key={`${i}-opt`} style={{ borderBottom: "1px solid rgba(70,140,200,0.08)", background: "rgba(255,179,0,0.03)" }}>
                           <td style={{ padding: "6px 6px", verticalAlign: "middle", color: "#3a4050", fontSize: 8 }}></td>
                           <td style={{ padding: "6px 6px", fontSize: 9, color: "#FFB300", fontWeight: 700, whiteSpace: "nowrap" }}>☀ OPT</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>{fmtD(r.firstSunlitPassDay)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300" }}>{fmtD(r.sunlitMeanRevisitDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#cc8800" }}>{fmtD(r.sunlitMaxGapDays)}</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a4a40" }}>—</td>
-                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700, lineHeight: 1.4 }}>
-                            <div>{fmtD(r.firstViewSunlitDay)}</div>
-                            {r.firstViewSunlitCloud !== null && <div style={{ fontSize: 8, color: "#a07820", fontWeight: 400 }}>{fmtD(r.firstViewSunlitCloud)} ☁{r.cloudPct}%</div>}
-                          </td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>{fmtD(r.firstSunlitPassDay)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700, lineHeight: 1.4 }}>
                             <div>{fmtD(r.hundredPctMappedSunlitDays)}</div>
                             {r.hundredPctMappedSunlitCloud !== null && <div style={{ fontSize: 8, color: "#a07820", fontWeight: 400 }}>{fmtD(r.hundredPctMappedSunlitCloud)} ☁</div>}
