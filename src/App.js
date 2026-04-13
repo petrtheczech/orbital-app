@@ -1269,10 +1269,13 @@ export default function App() {
           }
 
           // Pass-day-based revisit metrics
-          const allPassDays30 = allPasses
-            .filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30))
+          // firstAllPassDay / firstSunlitPassDay use ABSOLUTE midT (days from t=0)
+          // so the anchor country shows its real first-pass time, not 0.
+          const allPassesInWindow = allPasses
+            .filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30));
+          const allPassDays30 = allPassesInWindow
             .map(p => p.midT / 86400 - anchorOffsetDays).sort((a, b) => a - b);
-          const firstAllPassDay = allPassDays30.length > 0 ? allPassDays30[0] : null;
+          const firstAllPassDay = allPassesInWindow.length > 0 ? allPassesInWindow[0].midT / 86400 : null;
           const meanRevisitDays = allPassDays30.length > 1
             ? (allPassDays30[allPassDays30.length - 1] - allPassDays30[0]) / (allPassDays30.length - 1)
             : null;
@@ -1280,16 +1283,22 @@ export default function App() {
             ? Math.max(...allPassDays30.slice(1).map((d, i) => d - allPassDays30[i]))
             : null;
 
-          const sunlitPassDays30 = sunlitPasses
-            .filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30))
+          const sunlitPassesInWindow = sunlitPasses
+            .filter(p => inWindow(p, anchorOffsetDays, anchorOffsetDays + 30));
+          const sunlitPassDays30 = sunlitPassesInWindow
             .map(p => p.midT / 86400 - anchorOffsetDays).sort((a, b) => a - b);
-          const firstSunlitPassDay = sunlitPassDays30.length > 0 ? sunlitPassDays30[0] : null;
+          const firstSunlitPassDay = sunlitPassesInWindow.length > 0 ? sunlitPassesInWindow[0].midT / 86400 : null;
           const sunlitMeanRevisitDays = sunlitPassDays30.length > 1
             ? (sunlitPassDays30[sunlitPassDays30.length - 1] - sunlitPassDays30[0]) / (sunlitPassDays30.length - 1)
             : null;
           const sunlitMaxGapDays = sunlitPassDays30.length > 1
             ? Math.max(...sunlitPassDays30.slice(1).map((d, i) => d - sunlitPassDays30[i]))
             : null;
+
+          console.log(`[${effectiveSat.name} → ${cty.name}] RAAN: ${effectiveSat.raan.toFixed(1)}°` +
+            ` | firstPass: ${firstAllPassDay !== null ? (firstAllPassDay*24).toFixed(2)+'h' : 'null'}` +
+            ` | firstSunlit: ${firstSunlitPassDay !== null ? (firstSunlitPassDay*24).toFixed(2)+'h' : 'null'}` +
+            ` | passes: ${allPassDays30.length} total / ${sunlitPassDays30.length} sunlit (30d)`);
 
           // ── First View & 100% Mapped (analytical, off-nadir accounting) ──
           // Track heading at equator (degrees from North)
