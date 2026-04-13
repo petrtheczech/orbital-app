@@ -1068,7 +1068,7 @@ export default function App() {
   const mainRef = useRef(null);
   const selCtyObjs = COUNTRIES.filter(c => selCtys.includes(c.id));
   const [showAdd, setShowAdd] = useState(false);
-  const [commercialRate, setCommercialRate] = useState(15); // $/km²
+  const [commercialRate, setCommercialRate] = useState(15); // €/km²
   const [form, setForm] = useState({
     name: "", altitude: 500, inclination: 97.4, eccentricity: 0.001,
     raan: 0, argPerigee: 0, swathAngle: 12, offNadir: 30, dataCapacity: 500000, lifetime: 5
@@ -1528,10 +1528,10 @@ export default function App() {
         return n.toFixed(0);
       };
       const fmtM = (n) => {
-        if (n >= 1e9) return "$"+(n/1e9).toFixed(2)+"B";
-        if (n >= 1e6) return "$"+(n/1e6).toFixed(2)+"M";
-        if (n >= 1e3) return "$"+(n/1e3).toFixed(1)+"k";
-        return "$"+n.toFixed(0);
+        if (n >= 1e9) return "€"+(n/1e9).toFixed(2)+"B";
+        if (n >= 1e6) return "€"+(n/1e6).toFixed(2)+"M";
+        if (n >= 1e3) return "€"+(n/1e3).toFixed(1)+"k";
+        return "€"+n.toFixed(0);
       };
 
       const mkCell = (text, bold = false, center = false) =>
@@ -1711,7 +1711,7 @@ export default function App() {
           properties: { page: { size: { orientation: "landscape", width: 15840, height: 12240 } } },
           children: [
             new Paragraph({ text: "Orbital Coverage Analysis", heading: HeadingLevel.HEADING_1 }),
-            new Paragraph({ children: [new TextRun({ text: `Generated: ${new Date().toISOString().slice(0, 10)}  |  Satellites: ${sats.map(s => s.name).join(", ")}  |  Rate: $${commercialRate}/km²`, size: 18 })], spacing: { after: 400 } }),
+            new Paragraph({ children: [new TextRun({ text: `Generated: ${new Date().toISOString().slice(0, 10)}  |  Satellites: ${sats.map(s => s.name).join(", ")}  |  Rate: €${commercialRate}/km²`, size: 18 })], spacing: { after: 400 } }),
 
             new Paragraph({ text: "Revisit Analysis", heading: HeadingLevel.HEADING_2 }),
             new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: [revisitHdr, ...revisitRows] }),
@@ -1746,10 +1746,10 @@ export default function App() {
     return n.toFixed(0);
   };
   const fmtMoney = (n) => {
-    if (n >= 1e9) return "$" + (n / 1e9).toFixed(2) + "B";
-    if (n >= 1e6) return "$" + (n / 1e6).toFixed(2) + "M";
-    if (n >= 1e3) return "$" + (n / 1e3).toFixed(1) + "k";
-    return "$" + n.toFixed(0);
+    if (n >= 1e9) return "€" + (n / 1e9).toFixed(2) + "B";
+    if (n >= 1e6) return "€" + (n / 1e6).toFixed(2) + "M";
+    if (n >= 1e3) return "€" + (n / 1e3).toFixed(1) + "k";
+    return "€" + n.toFixed(0);
   };
 
   return (
@@ -1768,7 +1768,7 @@ export default function App() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           {/* Commercial rate */}
           <div style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(255,215,0,0.06)", border: "1px solid rgba(255,215,0,0.2)", borderRadius: 4, padding: "3px 8px" }}>
-            <span style={{ fontSize: 8, color: "#b8a040", letterSpacing: 1 }}>$/km²</span>
+            <span style={{ fontSize: 8, color: "#b8a040", letterSpacing: 1 }}>€/km²</span>
             <input type="number" value={commercialRate} onChange={e => setCommercialRate(+e.target.value || 0)}
               style={{ width: 50, background: "transparent", border: "none", color: "#FFD740", fontSize: 11, fontFamily: "inherit", fontWeight: 700, textAlign: "center", outline: "none" }} />
           </div>
@@ -2016,7 +2016,7 @@ export default function App() {
               </div>
               <Lbl>COMMERCIAL RATE</Lbl>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 12 }}>
-                <span style={{ fontSize: 9, color: "#b8a040" }}>$</span>
+                <span style={{ fontSize: 9, color: "#b8a040" }}>€</span>
                 <input type="number" value={commercialRate} onChange={e => setCommercialRate(+e.target.value || 0)}
                   style={{ width: 70, background: "rgba(4,8,16,0.9)", border: "1px solid rgba(255,215,0,0.2)", color: "#FFD740", padding: "4px 6px", borderRadius: 3, fontSize: 11, fontFamily: "inherit", fontWeight: 700 }} />
                 <span style={{ fontSize: 8, color: "#706830" }}>per km²</span>
@@ -2441,7 +2441,7 @@ export default function App() {
                   <input type="number" min="0" step="1" value={commercialRate}
                     onChange={e => setCommercialRate(+e.target.value || 0)}
                     style={{ width: 56, background: "rgba(4,8,16,0.9)", border: "1px solid rgba(70,140,200,0.25)", color: "#FFD740", padding: "3px 5px", borderRadius: 3, fontSize: 10, fontFamily: "inherit", textAlign: "center" }} />
-                  <span style={{ fontSize: 8, color: "#2a4a60" }}>$/km²</span>
+                  <span style={{ fontSize: 8, color: "#2a4a60" }}>€/km²</span>
                 </div>
               </div>
               {sats.map(sat => {
@@ -2506,7 +2506,7 @@ export default function App() {
                         <div key={k} style={{ padding: "7px 10px", background: "rgba(70,255,100,0.04)", border: "1px solid rgba(70,255,100,0.12)", borderRadius: 4 }}>
                           <div style={{ fontSize: 7, color: "#2a5a40", letterSpacing: 1, marginBottom: 3 }}>{k.toUpperCase()}</div>
                           <div style={{ fontSize: 13, color: c, fontWeight: 700 }}>{v}</div>
-                          <div style={{ fontSize: 8, color: "#2a4a30", marginTop: 1 }}>@ ${commercialRate}/km² · net (cloud-free)</div>
+                          <div style={{ fontSize: 8, color: "#2a4a30", marginTop: 1 }}>@ €{commercialRate}/km² · net (cloud-free)</div>
                         </div>
                       ))}
                     </div>
