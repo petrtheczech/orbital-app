@@ -651,94 +651,83 @@ function dataUrlToUint8Array(dataUrl) {
 }
 
 // OSM tile compositing on a canvas for a real map background
-function useMapImage(cty, svgW, svgH) {
-  const [imgSrc, setImgSrc] = useState(null);
-  const canvasRef = useRef(null);
+function useMapImage(viewBounds, svgW, svgH) {
+  const [tile, setTile] = useState(null); // { imgSrc, bounds }
 
-  const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
-  const margin = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
-  const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
-  const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
-
-  // Calculate optimal zoom
-  const maxSpan = Math.max(vLatMax - vLatMin, (vLonMax - vLonMin) * Math.cos(((cty.latMin + cty.latMax) / 2) * DEG));
+  const { latMin: vLatMin, latMax: vLatMax, lonMin: vLonMin, lonMax: vLonMax } = viewBounds;
+  const maxSpan = Math.max(vLatMax - vLatMin, (vLonMax - vLonMin) * Math.cos(((vLatMin + vLatMax) / 2) * DEG));
   const zoom = Math.max(1, Math.min(12, Math.round(Math.log2(360 / maxSpan)) + 1));
 
   useEffect(() => {
-    const latMerc = lat => Math.log(Math.tan((45 + lat / 2) * DEG));
-    const n = Math.pow(2, zoom);
-    const tileXMin = Math.floor(((vLonMin + 180) / 360) * n);
-    const tileXMax = Math.floor(((vLonMax + 180) / 360) * n);
-    const tileYMin = Math.floor((1 - latMerc(vLatMax) / Math.PI) / 2 * n);
-    const tileYMax = Math.floor((1 - latMerc(vLatMin) / Math.PI) / 2 * n);
+    let cancelled = false;
+    const bounds = { latMin: vLatMin, latMax: vLatMax, lonMin: vLonMin, lonMax: vLonMax };
+    const tid = setTimeout(() => {
+      const latMerc = lat => Math.log(Math.tan((45 + lat / 2) * DEG));
+      const n = Math.pow(2, zoom);
+      const tileXMin = Math.floor(((vLonMin + 180) / 360) * n);
+      const tileXMax = Math.floor(((vLonMax + 180) / 360) * n);
+      const tileYMin = Math.floor((1 - latMerc(vLatMax) / Math.PI) / 2 * n);
+      const tileYMax = Math.floor((1 - latMerc(vLatMin) / Math.PI) / 2 * n);
 
-    const totalTilesX = tileXMax - tileXMin + 1;
-    const totalTilesY = tileYMax - tileYMin + 1;
-    const compositeW = totalTilesX * 256;
-    const compositeH = totalTilesY * 256;
+      const totalTilesX = tileXMax - tileXMin + 1;
+      const totalTilesY = tileYMax - tileYMin + 1;
+      const compositeW = totalTilesX * 256;
+      const compositeH = totalTilesY * 256;
 
-    const cvs = document.createElement("canvas");
-    cvs.width = compositeW;
-    cvs.height = compositeH;
-    const ctx = cvs.getContext("2d");
-    // Fill with water color first
-    ctx.fillStyle = "#aad3df";
-    ctx.fillRect(0, 0, compositeW, compositeH);
+      const cvs = document.createElement("canvas");
+      cvs.width = compositeW;
+      cvs.height = compositeH;
+      const ctx = cvs.getContext("2d");
+      ctx.fillStyle = "#aad3df";
+      ctx.fillRect(0, 0, compositeW, compositeH);
 
-    let loaded = 0;
-    const totalTiles = totalTilesX * totalTilesY;
+      let loaded = 0;
+      const totalTiles = totalTilesX * totalTilesY;
 
-    const tryFinalize = () => {
-      loaded++;
-      if (loaded >= totalTiles) {
-        // Crop to our viewport
-        const pxPerTileLon = 256;
-        const pxPerTileY = 256;
-
-        // Convert viewport bounds to pixel coords within the composite
+      const tryFinalize = () => {
+        loaded++;
+        if (loaded < totalTiles) return;
+        if (cancelled) return;
         const vpxLeft = ((vLonMin + 180) / 360 * n - tileXMin) * 256;
         const vpxRight = ((vLonMax + 180) / 360 * n - tileXMin) * 256;
         const vpyTop = ((1 - latMerc(vLatMax) / Math.PI) / 2 * n - tileYMin) * 256;
         const vpyBot = ((1 - latMerc(vLatMin) / Math.PI) / 2 * n - tileYMin) * 256;
-
-        const cropW = vpxRight - vpxLeft;
-        const cropH = vpyBot - vpyTop;
-
         const outCvs = document.createElement("canvas");
         outCvs.width = Math.round(svgW);
         outCvs.height = Math.round(svgH);
         const outCtx = outCvs.getContext("2d");
-        outCtx.drawImage(cvs, vpxLeft, vpyTop, cropW, cropH, 0, 0, svgW, svgH);
-        setImgSrc(outCvs.toDataURL("image/jpeg", 0.85));
-      }
-    };
+        outCtx.drawImage(cvs, vpxLeft, vpyTop, vpxRight - vpxLeft, vpyBot - vpyTop, 0, 0, svgW, svgH);
+        setTile({ imgSrc: outCvs.toDataURL("image/jpeg", 0.85), bounds });
+      };
 
-    for (let tx = tileXMin; tx <= tileXMax; tx++) {
-      for (let ty = tileYMin; ty <= tileYMax; ty++) {
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        const dx = (tx - tileXMin) * 256;
-        const dy = (ty - tileYMin) * 256;
-        img.onload = () => { ctx.drawImage(img, dx, dy, 256, 256); tryFinalize(); };
-        img.onerror = () => {
-          // Draw land-colored fallback
-          ctx.fillStyle = "#c8d8b0";
-          ctx.fillRect(dx, dy, 256, 256);
-          tryFinalize();
-        };
-        const s = ["a","b","c"][(tx + ty) % 3];
-        img.src = `https://${s}.tile.openstreetmap.org/${zoom}/${tx}/${ty}.png`;
+      for (let tx = tileXMin; tx <= tileXMax; tx++) {
+        for (let ty = tileYMin; ty <= tileYMax; ty++) {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          const dx = (tx - tileXMin) * 256;
+          const dy = (ty - tileYMin) * 256;
+          img.onload = () => { ctx.drawImage(img, dx, dy, 256, 256); tryFinalize(); };
+          img.onerror = () => { ctx.fillStyle = "#c8d8b0"; ctx.fillRect(dx, dy, 256, 256); tryFinalize(); };
+          const s = ["a","b","c"][(tx + ty) % 3];
+          img.src = `https://${s}.tile.openstreetmap.org/${zoom}/${tx}/${ty}.png`;
+        }
       }
-    }
-  }, [cty.id, zoom, svgW, svgH]);
+    }, 250);
+    return () => { cancelled = true; clearTimeout(tid); };
+  }, [vLatMin, vLatMax, vLonMin, vLonMax, zoom, svgW, svgH]); // eslint-disable-line
 
-  return imgSrc;
+  return tile;
 }
 
 function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height = 440, extraCountries = null, anchorCtyId = null }) {
   const [tfIdx, setTfIdx] = useState(2);
   const [sunlitOnly, setSunlitOnly] = useState(false);
   const tfDays = TRACK_TF_OPTS[tfIdx].d;
+  const [viewBounds, setViewBounds] = useState(null); // null = use default bounds
+  const [isDragging, setIsDragging] = useState(false);
+  const dragRef = useRef(null);
+  const mapRef = useRef(null);
+  const vbRef = useRef(null); // always holds latest vb for wheel handler closure
 
   // Combined view: merge all countries into a single bounding box used for
   // viewport, map background, and pass detection. Individual borders are
@@ -778,14 +767,24 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
 
   // cty is already set above (either combined bounds or single country)
   const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
-  const margin = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
-  const vLatMin = cty.latMin - margin, vLatMax = cty.latMax + margin;
-  const vLonMin = cty.lonMin - margin, vLonMax = cty.lonMax + margin;
-  const vdLon = vLonMax - vLonMin;
-
   const svgH = height - 48;
   const svgW = width - 8;
   const cosM = Math.cos(((cty.latMin + cty.latMax) / 2) * DEG);
+
+  // Compute default viewport from country bounds + margin
+  const _m = Math.min(Math.max(dLat, dLon) * 0.25, 0.5);
+  const defaultBounds = {
+    latMin: cty.latMin - _m, latMax: cty.latMax + _m,
+    lonMin: cty.lonMin - _m, lonMax: cty.lonMax + _m,
+  };
+  // Reset view whenever the country changes
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setViewBounds(null); }, [cty.id]);
+  const vb = viewBounds ?? defaultBounds;
+  vbRef.current = vb; // keep ref in sync for wheel handler
+
+  const { latMin: vLatMin, latMax: vLatMax, lonMin: vLonMin, lonMax: vLonMax } = vb;
+  const vdLon = vLonMax - vLonMin;
 
   // Mercator projection
   const latToMerc = lat => Math.log(Math.tan((45 + lat / 2) * DEG));
@@ -794,8 +793,67 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
   const tX = lon => ((lon - vLonMin) / vdLon) * svgW;
   const tY = lat => ((mercMax - latToMerc(Math.max(-85, Math.min(85, lat)))) / mercSpan) * svgH;
 
-  // Get real map background
-  const mapImg = useMapImage(cty, svgW, svgH);
+  // Map tile image — debounced internally; positioned via tile.bounds in render
+  const tile = useMapImage(vb, svgW, svgH);
+
+  // Wheel zoom — must use addEventListener (passive:false) so preventDefault works
+  useEffect(() => {
+    const el = mapRef.current;
+    if (!el) return;
+    const handler = (e) => {
+      e.preventDefault();
+      const factor = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+      const rect = el.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      const { latMin, latMax, lonMin, lonMax } = vbRef.current;
+      const mMax = Math.log(Math.tan((45 + latMax / 2) * DEG));
+      const mMin = Math.log(Math.tan((45 + latMin / 2) * DEG));
+      const mSpan = mMax - mMin;
+      const h = el.offsetHeight, w = el.offsetWidth;
+      const curLon = lonMin + (cx / w) * (lonMax - lonMin);
+      const curMerc = mMax - (cy / h) * mSpan;
+      const m2lat = m => (Math.atan(Math.exp(m)) / DEG - 45) * 2;
+      const nMercMax = curMerc + (mMax - curMerc) * factor;
+      const nMercMin = curMerc + (mMin - curMerc) * factor;
+      setViewBounds({
+        latMin: Math.max(-85, m2lat(Math.min(nMercMin, nMercMax))),
+        latMax: Math.min(85, m2lat(Math.max(nMercMin, nMercMax))),
+        lonMin: Math.max(-180, curLon + (lonMin - curLon) * factor),
+        lonMax: Math.min(180, curLon + (lonMax - curLon) * factor),
+      });
+    };
+    el.addEventListener('wheel', handler, { passive: false });
+    return () => el.removeEventListener('wheel', handler);
+  }, []); // eslint-disable-line
+
+  // Drag pan handlers
+  const onMapMouseDown = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+    dragRef.current = { x: e.clientX, y: e.clientY, bounds: vbRef.current };
+  };
+  const onMapMouseMove = (e) => {
+    if (!dragRef.current) return;
+    const { x: sx, y: sy, bounds: sb } = dragRef.current;
+    const dx = e.clientX - sx, dy = e.clientY - sy;
+    const { latMin, latMax, lonMin, lonMax } = sb;
+    const lonSpan = lonMax - lonMin;
+    const mMax = Math.log(Math.tan((45 + latMax / 2) * DEG));
+    const mMin = Math.log(Math.tan((45 + latMin / 2) * DEG));
+    const mSpan = mMax - mMin;
+    const newMercMax = mMax + (dy / svgH) * mSpan;
+    const newMercMin = mMin + (dy / svgH) * mSpan;
+    const m2lat = m => (Math.atan(Math.exp(m)) / DEG - 45) * 2;
+    const newLonMin = lonMin - (dx / svgW) * lonSpan;
+    setViewBounds({
+      latMin: Math.max(-85, m2lat(newMercMin)),
+      latMax: Math.min(85, m2lat(newMercMax)),
+      lonMin: Math.max(-180, newLonMin),
+      lonMax: Math.min(180, newLonMin + lonSpan),
+    });
+  };
+  const onMapMouseUp = () => { dragRef.current = null; setIsDragging(false); };
 
   // Grid
   const gStep = dLat > 15 ? 5 : dLat > 5 ? 2 : dLat > 2 ? 1 : 0.5;
@@ -814,13 +872,24 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
       border: "1px solid rgba(70,140,200,0.15)",
       overflow: "hidden", width
     }}>
-      <div style={{ position: "relative", display: "flex", justifyContent: "center", padding: 4, minHeight: svgH }}>
-        {/* Real map background image */}
-        {mapImg && (
-          <img src={mapImg} alt="" style={{
-            position: "absolute", top: 4, left: 4,
-            width: svgW, height: svgH, borderRadius: 4,
-            objectFit: "fill", zIndex: 0
+      <div ref={mapRef}
+      onMouseDown={onMapMouseDown}
+      onMouseMove={onMapMouseMove}
+      onMouseUp={onMapMouseUp}
+      onMouseLeave={onMapMouseUp}
+      style={{
+        position: "relative", display: "flex", justifyContent: "center", padding: 4, minHeight: svgH,
+        cursor: isDragging ? "grabbing" : "grab", userSelect: "none",
+      }}>
+        {/* Tile background — positioned to match its render bounds within the current viewport */}
+        {tile && (
+          <img src={tile.imgSrc} alt="" style={{
+            position: "absolute",
+            left: 4 + tX(tile.bounds.lonMin),
+            top: 4 + tY(tile.bounds.latMax),
+            width: Math.max(1, tX(tile.bounds.lonMax) - tX(tile.bounds.lonMin)),
+            height: Math.max(1, tY(tile.bounds.latMin) - tY(tile.bounds.latMax)),
+            objectFit: "fill", zIndex: 0,
           }} />
         )}
 
@@ -836,14 +905,14 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
             </clipPath>
           </defs>
 
-          {/* Fallback background (hidden when map loads) */}
-          {!mapImg && <>
+          {/* Fallback background (shown until tiles load) */}
+          {!tile && <>
             <rect width={svgW} height={svgH} fill="#aad3df" />
             <rect width={svgW} height={svgH} fill="#c4d4b4" opacity="0.7" />
           </>}
 
           {/* Semi-transparent overlay so tracks are visible over map */}
-          {mapImg && <rect width={svgW} height={svgH} fill="rgba(255,255,255,0.1)" />}
+          {tile && <rect width={svgW} height={svgH} fill="rgba(255,255,255,0.1)" />}
 
           {/* Grid */}
           {latLines.map(la => (
@@ -867,7 +936,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
               : `${tX(ct.lonMin)},${tY(ct.latMax)} ${tX(ct.lonMax)},${tY(ct.latMax)} ${tX(ct.lonMax)},${tY(ct.latMin)} ${tX(ct.lonMin)},${tY(ct.latMin)}`;
             const isAnch = ct.id === anchorCtyId;
             return <polygon key={`fill-${ct.id}`} points={pts}
-              fill={mapImg ? (isAnch ? "rgba(255,179,0,0.2)" : "rgba(120,175,100,0.15)") : (isAnch ? "rgba(255,179,0,0.4)" : "rgba(120,175,100,0.45)")}
+              fill={tile ? (isAnch ? "rgba(255,179,0,0.2)" : "rgba(120,175,100,0.15)") : (isAnch ? "rgba(255,179,0,0.4)" : "rgba(120,175,100,0.45)")}
               stroke={isAnch ? "#FFB300" : "#2a6020"} strokeWidth="2.5" strokeDasharray="8,4" />;
           })}
 
@@ -965,6 +1034,14 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
           fontSize: 9, fontFamily: "'IBM Plex Mono',monospace", fontWeight: sunlitOnly ? 700 : 400,
           transition: "all 0.15s"
         }}>{sunlitOnly ? "☀ Sunlit" : "All passes"}</button>
+        {viewBounds && (
+          <button onClick={() => setViewBounds(null)} title="Reset to default view" style={{
+            marginLeft: 4, padding: "4px 8px", borderRadius: 4, cursor: "pointer",
+            background: "rgba(70,140,200,0.08)",
+            border: "1px solid rgba(70,140,200,0.25)",
+            color: "#5a8ab0", fontSize: 9, fontFamily: "'IBM Plex Mono',monospace",
+          }}>⌂</button>
+        )}
       </div>
     </div>
   );
