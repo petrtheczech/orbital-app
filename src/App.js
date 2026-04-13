@@ -1605,26 +1605,57 @@ export default function App() {
         ];
       });
 
-      // ── UTILIZATION TABLE ──
-      const utilHdr = mkHdr(["Satellite", "Country", "Passes/30d", "Avg Track", "km²/pass", "km²/yr", "Demand Share"]);
+      // ── UTILIZATION TABLE (satellite summary + per-country breakdown) ──
+      const utilHdr = mkHdr(["Satellite / Country", "Avg Daily Demand", "Max Daily Potential", "Daily Capacity", "Utilization", "Headroom", "Actual km²/yr", "Passes/30d", "km²/pass", "Demand Share"]);
       const utilRows = sats.flatMap(sat => {
         const satResults = (results || []).filter(r => r.satId === sat.id);
+        if (!satResults.length) return [];
+        const dailyCap = satResults[0].satDataCapacity || 0;
         const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30), 0);
-        return satResults.map(r => {
+        const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
+        const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
+        const headroom = dailyCap > 0 ? dailyCap - totalUncappedDaily : null;
+        const actualPerYear = effectiveDaily * 365.25;
+        // Max daily potential: peak single-day total across all countries
+        const dayTotals = new Float64Array(30);
+        for (const r of satResults) {
+          const cpd = r.sunlitCoveragePerDay || [];
+          for (let d = 0; d < 30; d++) dayTotals[d] += cpd[d] || 0;
+        }
+        const maxDailyPotential = Math.max(...dayTotals);
+        const isCapLimited = dailyCap > 0 && totalUncappedDaily > dailyCap;
+        // Satellite summary row
+        const satRow = new TableRow({ children: [
+          mkCell(`${sat.name}${(satResults[0].satCount||1)>1 ? ` ×${satResults[0].satCount}` : ""} [${isCapLimited ? "CAP LIMITED" : "OPP LIMITED"}]`, true),
+          mkCell(`${fmtN(totalUncappedDaily)} km²/d`, true, true),
+          mkCell(maxDailyPotential > 0 ? `${fmtN(maxDailyPotential)} km²/d` : "—", true, true),
+          mkCell(dailyCap > 0 ? `${fmtN(dailyCap)} km²/d` : "—", true, true),
+          mkCell(utilization !== null ? `${utilization.toFixed(0)}%` : "—", true, true),
+          mkCell(headroom !== null ? `${headroom >= 0 ? "+" : "−"}${fmtN(Math.abs(headroom))} km²/d` : "—", true, true),
+          mkCell(`${fmtN(actualPerYear)} km²`, true, true),
+          mkCell("", false, true),
+          mkCell("", false, true),
+          mkCell("", false, true),
+        ]});
+        // Per-country detail rows
+        const countryRows = satResults.map(r => {
           const grossPerPass = r.avgSunlitPassLengthKm * r.swKm;
-          const annualImagery = (r.sunlitPassCountByTf[30]||0) * (365.25/30) * grossPerPass;
           const dailyDemand = (r.uncappedSunlitAreaByTf[30]||0)/30;
           const share = totalUncappedDaily > 0 ? (dailyDemand/totalUncappedDaily*100) : 0;
           return new TableRow({ children: [
-            mkCell(sat.name, true),
-            mkCell(r.countryName),
+            mkCell(`  → ${r.countryName}`),
+            mkCell(`${fmtN(dailyDemand)} km²/d`, false, true),
+            mkCell("—", false, true),
+            mkCell("—", false, true),
+            mkCell("—", false, true),
+            mkCell("—", false, true),
+            mkCell("—", false, true),
             mkCell(String(r.sunlitPassCountByTf[30]||0), false, true),
-            mkCell(`${r.avgSunlitPassLengthKm.toFixed(0)} km`, false, true),
             mkCell(`${fmtN(grossPerPass)} km²`, false, true),
-            mkCell(`${fmtN(annualImagery)} km²`, false, true),
             mkCell(`${share.toFixed(1)}%`, false, true),
           ]});
         });
+        return [satRow, ...countryRows];
       });
 
       // ── COMMERCIAL VALUE TABLE ──
