@@ -1291,6 +1291,47 @@ export default function App() {
             ? Math.max(...sunlitPassDays30.slice(1).map((d, i) => d - sunlitPassDays30[i]))
             : null;
 
+          // ── First View & 100% Mapped (analytical, off-nadir accounting) ──
+          // Track heading at equator (degrees from North)
+          const inclDeg = effectiveSat.inclination;
+          const headingRad_fv = (90 - Math.min(inclDeg, 180 - inclDeg)) * DEG;
+          // Country dimensions
+          const ctyCenterLat = (cty.latMin + cty.latMax) / 2;
+          const ctyNS_km = (cty.latMax - cty.latMin) * 111.32;
+          const ctyEW_km = (cty.lonMax - cty.lonMin) * 111.32 * Math.cos(ctyCenterLat * DEG);
+          // Width of country perpendicular to satellite track
+          const perpWidth_km = ctyNS_km * Math.abs(Math.sin(headingRad_fv)) + ctyEW_km * Math.abs(Math.cos(headingRad_fv));
+          // Off-nadir corridor width
+          const offNadirDeg = effectiveSat.offNadir || 0;
+          let corridorKm = sw;
+          if (offNadirDeg > 0) {
+            const sinArg = (R_E + effectiveSat.altitude) / R_E * Math.sin(offNadirDeg * DEG);
+            if (sinArg < 1) {
+              const reachKm = R_E * (Math.asin(sinArg) - offNadirDeg * DEG);
+              corridorKm = 2 * Math.max(0, reachKm) + sw;
+            }
+          }
+          // First View: day when every point is within corridor of at least one pass
+          let firstViewAllDay, firstViewSunlitDay;
+          if (corridorKm >= perpWidth_km) {
+            // One pass's corridor covers the whole country
+            firstViewAllDay = firstAllPassDay;
+            firstViewSunlitDay = firstSunlitPassDay;
+          } else {
+            // Multiple passes needed to scan country via off-nadir steering
+            const stripsForView = Math.ceil(perpWidth_km / corridorKm);
+            firstViewAllDay = allPassDays30.length > 0 ? 30 * stripsForView / allPassDays30.length : null;
+            firstViewSunlitDay = sunlitPassDays30.length > 0 ? 30 * stripsForView / sunlitPassDays30.length : null;
+          }
+          // 100% Mapped: time to image every point using optimal nadir-strip scheduling
+          // Uses nadir swath (not corridor) because each imaging strip must be captured
+          const stripsNeeded100 = Math.ceil(perpWidth_km / sw);
+          const sunlitCnt30 = sunlitPassDays30.length;
+          const allCnt30 = allPassDays30.length;
+          const hundredPctMappedSunlitDays = sunlitCnt30 > 0 ? 30 * stripsNeeded100 / sunlitCnt30 : null;
+          const hundredPctMappedAllDays = allCnt30 > 0 ? 30 * stripsNeeded100 / allCnt30 : null;
+          const offNadirNote = offNadirDeg === 0; // flag: no off-nadir steering available
+
           // Covered area per timeframe (sunlit passes × swath × track length, capped at daily capacity)
           const coveredAreaSunlitByTf = {};
           const uncappedSunlitAreaByTf = {};
@@ -1417,6 +1458,9 @@ export default function App() {
             firstImgBest, firstImgWorst,
             firstAllPassDay, meanRevisitDays, maxGapDays,
             firstSunlitPassDay, sunlitMeanRevisitDays, sunlitMaxGapDays,
+            firstViewAllDay, firstViewSunlitDay,
+            hundredPctMappedSunlitDays, hundredPctMappedAllDays,
+            offNadirNote,
             passCountByTf,
             sunlitPassCountByTf,
             coveredAreaSunlitByTf,
@@ -1500,9 +1544,16 @@ export default function App() {
       const mkHdr = (cols) => new TableRow({ children: cols.map(h => mkCell(h, true, true)) });
 
       // ── REVISIT ANALYSIS TABLE ──
-      const revisitHdr = mkHdr(["Satellite → Country", "Mode", "First Pass", "Mean Revisit", "Max Gap", "100% Coverage", "1d", "3d", "5d", "7d", "14d", "30d"]);
+      const revisitHdr = mkHdr(["Satellite → Country", "Mode", "First Pass", "Mean Revisit", "Max Gap", "100% Coverage", "First View", "100% Mapped", "1d", "3d", "5d", "7d", "14d", "30d"]);
       const revisitRows = (results || []).flatMap(r => {
         const pc = r.passCountByTf || {}, spc = r.sunlitPassCountByTf || {};
+        const fmtDw = (d) => {
+          if (d === null || d === undefined) return "—";
+          if (d < 1/24) return `${(d * 24 * 60).toFixed(0)} min`;
+          if (d < 1) return `${(d * 24).toFixed(1)} hrs`;
+          if (d > 365) return ">1yr";
+          return `${d.toFixed(1)} days`;
+        };
         return [
           new TableRow({ children: [
             mkCell(`${r.satName} → ${r.countryName}`, true),
@@ -1511,6 +1562,8 @@ export default function App() {
             mkCell(fmtD(r.meanRevisitDays), false, true),
             mkCell(fmtD(r.maxGapDays), false, true),
             mkCell(r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`, false, true),
+            mkCell(fmtDw(r.firstViewAllDay), false, true),
+            mkCell(fmtDw(r.hundredPctMappedAllDays) + (r.offNadirNote ? " (nadir)" : ""), false, true),
             ...[1,3,5,7,14,30].map(b => mkCell(String(pc[b]||0), false, true)),
           ]}),
           new TableRow({ children: [
@@ -1520,6 +1573,8 @@ export default function App() {
             mkCell(fmtD(r.sunlitMeanRevisitDays), false, true),
             mkCell(fmtD(r.sunlitMaxGapDays), false, true),
             mkCell("—", false, true),
+            mkCell(fmtDw(r.firstViewSunlitDay), false, true),
+            mkCell(fmtDw(r.hundredPctMappedSunlitDays) + (r.offNadirNote ? " (nadir)" : ""), false, true),
             ...[1,3,5,7,14,30].map(b => mkCell(String(spc[b]||0), false, true)),
           ]}),
         ];
@@ -2048,6 +2103,8 @@ export default function App() {
                         { label: "Mean\nRevisit", center: true },
                         { label: "Max\nGap", center: true },
                         { label: "100%\nCoverage", center: true },
+                        { label: "First\nView", center: true },
+                        { label: "100%\nMapped", center: true },
                         { label: "1d\npasses", center: true, sep: true },
                         { label: "3d\npasses", center: true },
                         { label: "5d\npasses", center: true },
@@ -2058,7 +2115,7 @@ export default function App() {
                         <th key={i} style={{
                           textAlign: h.center ? "center" : "left",
                           padding: "7px 6px",
-                          color: h.sep ? "#4a8898" : i < 6 ? "#2a5a78" : "#4a8898",
+                          color: h.sep ? "#4a8898" : i < 8 ? "#2a5a78" : "#4a8898",
                           fontWeight: 600, fontSize: 8, letterSpacing: 0.8,
                           whiteSpace: "pre-line", verticalAlign: "bottom",
                           borderLeft: h.sep ? "1px solid rgba(70,140,200,0.12)" : "none"
@@ -2072,6 +2129,7 @@ export default function App() {
                         if (d === null || d === undefined) return "—";
                         if (d < 1/24) return `${(d * 24 * 60).toFixed(0)} min`;
                         if (d < 1) return `${(d * 24).toFixed(1)} hrs`;
+                        if (d > 365) return ">1yr";
                         return `${d.toFixed(1)} days`;
                       };
                       const pc = r.passCountByTf || {};
@@ -2089,6 +2147,11 @@ export default function App() {
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#a0d0e8" }}>{fmtD(r.meanRevisitDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFD740" }}>{fmtD(r.maxGapDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", fontWeight: 700, color: r.fullCovDay !== null ? "#64FFDA" : "#FF8A80" }}>{r.fullCovDay !== null ? fmtD(r.fullCovDay) : `>D${tf}`}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#64c8e8", fontWeight: 600 }}>{fmtD(r.firstViewAllDay)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a6a80", fontSize: 9 }}>
+                            {fmtD(r.hundredPctMappedAllDays)}
+                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#3a5060", marginTop: 1 }}>nadir only</div>}
+                          </td>
                           {[1,3,5,7,14,30].map((b, bi) => (
                             <td key={b} style={{ padding: "6px 6px", textAlign: "center", fontWeight: 600, borderLeft: bi === 0 ? "1px solid rgba(70,140,200,0.08)" : "none", color: (pc[b] || 0) === 0 ? "#3a4a58" : (pc[b] || 0) >= 5 ? "#64FFDA" : "#a0d0e8" }}>
                               {pc[b] || 0}
@@ -2102,6 +2165,11 @@ export default function App() {
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300" }}>{fmtD(r.sunlitMeanRevisitDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#cc8800" }}>{fmtD(r.sunlitMaxGapDays)}</td>
                           <td style={{ padding: "6px 6px", textAlign: "center", color: "#4a4a40" }}>—</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>{fmtD(r.firstViewSunlitDay)}</td>
+                          <td style={{ padding: "6px 6px", textAlign: "center", color: "#FFB300", fontWeight: 700 }}>
+                            {fmtD(r.hundredPctMappedSunlitDays)}
+                            {r.offNadirNote && <div style={{ fontSize: 7, color: "#806040", marginTop: 1 }}>nadir only</div>}
+                          </td>
                           {[1,3,5,7,14,30].map((b, bi) => {
                             const ca = (r.coveredAreaSunlitByTf || {})[b];
                             const caStr = ca > 0 ? (ca >= 1e6 ? `${(ca/1e6).toFixed(1)}M` : ca >= 1e3 ? `${(ca/1e3).toFixed(1)}k` : ca.toFixed(0)) : null;
