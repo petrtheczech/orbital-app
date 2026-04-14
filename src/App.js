@@ -1694,7 +1694,7 @@ export default function App() {
         const satResults = (results || []).filter(r => r.satId === sat.id);
         if (!satResults.length) return [];
         const dailyCap = satResults[0].satDataCapacity || 0;
-        const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30), 0);
+        const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30) * (1 - (r.cloudPct||50)/100), 0);
         const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
         const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
         const headroom = dailyCap > 0 ? dailyCap - totalUncappedDaily : null;
@@ -2555,7 +2555,7 @@ export default function App() {
                 const satResults = results.filter(r => r.satId === sat.id);
                 if (!satResults.length) return null;
                 const dailyCap = satResults[0].satDataCapacity;
-                const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30] || 0) / 30), 0);
+                const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30] || 0) / 30) * (1 - (r.cloudPct||50)/100), 0);
                 const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
                 const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
                 const isCapLimited = dailyCap > 0 && totalUncappedDaily > dailyCap;
