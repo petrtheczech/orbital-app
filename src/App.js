@@ -1694,26 +1694,25 @@ export default function App() {
         const satResults = (results || []).filter(r => r.satId === sat.id);
         if (!satResults.length) return [];
         const dailyCap = satResults[0].satDataCapacity || 0;
-        // Max Daily Potential: best clear-sky single day across 30d, NO cloud penalty
+        const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30), 0);
+        const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
+        const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
+        const headroom = dailyCap > 0 ? dailyCap - totalUncappedDaily : null;
+        const actualPerYear = effectiveDaily * 365.25;
+        const satLifetime = satResults[0].satLifetime || 5;
+        const actualLifetime = actualPerYear * satLifetime;
+        // Max daily potential: peak single-day total across all countries
         const dayTotals = new Float64Array(30);
         for (const r of satResults) {
           const cpd = r.sunlitCoveragePerDay || [];
           for (let d = 0; d < 30; d++) dayTotals[d] += cpd[d] || 0;
         }
         const maxDailyPotential = Math.max(...dayTotals);
-        // Avg Daily Demand: realistic average WITH per-country cloud penalty
-        const avgDailyDemand = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30]||0)/30) * (1 - (r.cloudPct||50)/100), 0);
-        const effectiveDaily = dailyCap > 0 ? Math.min(avgDailyDemand, dailyCap) : avgDailyDemand;
-        const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
-        const headroom = dailyCap > 0 ? dailyCap - avgDailyDemand : null;
-        const actualPerYear = effectiveDaily * 365.25;
-        const satLifetime = satResults[0].satLifetime || 5;
-        const actualLifetime = actualPerYear * satLifetime;
-        const isCapLimited = dailyCap > 0 && avgDailyDemand > dailyCap;
+        const isCapLimited = dailyCap > 0 && totalUncappedDaily > dailyCap;
         // Satellite summary row
         const satRow = new TableRow({ children: [
           mkCell(`${sat.name}${(satResults[0].satCount||1)>1 ? ` ×${satResults[0].satCount}` : ""} [${isCapLimited ? "CAP LIMITED" : "OPP LIMITED"}]`, true),
-          mkCell(`${fmtN(avgDailyDemand)} km²/d`, true, true),
+          mkCell(`${fmtN(totalUncappedDaily)} km²/d`, true, true),
           mkCell(maxDailyPotential > 0 ? `${fmtN(maxDailyPotential)} km²/d` : "—", true, true),
           mkCell(dailyCap > 0 ? `${fmtN(dailyCap)} km²/d` : "—", true, true),
           mkCell(utilization !== null ? `${utilization.toFixed(0)}%` : "—", true, true),
@@ -1727,8 +1726,8 @@ export default function App() {
         // Per-country detail rows
         const countryRows = satResults.map(r => {
           const grossPerPass = r.avgSunlitPassLengthKm * r.swKm;
-          const dailyDemand = ((r.uncappedSunlitAreaByTf[30]||0)/30) * (1 - (r.cloudPct||50)/100);
-          const share = avgDailyDemand > 0 ? (dailyDemand/avgDailyDemand*100) : 0;
+          const dailyDemand = (r.uncappedSunlitAreaByTf[30]||0)/30;
+          const share = totalUncappedDaily > 0 ? (dailyDemand/totalUncappedDaily*100) : 0;
           return new TableRow({ children: [
             mkCell(`  → ${r.countryName}`),
             mkCell(`${fmtN(dailyDemand)} km²/d`, false, true),
@@ -2556,21 +2555,20 @@ export default function App() {
                 const satResults = results.filter(r => r.satId === sat.id);
                 if (!satResults.length) return null;
                 const dailyCap = satResults[0].satDataCapacity;
-                // Max Daily Potential: best clear-sky single day, NO cloud penalty
+                const totalUncappedDaily = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30] || 0) / 30), 0);
+                const effectiveDaily = dailyCap > 0 ? Math.min(totalUncappedDaily, dailyCap) : totalUncappedDaily;
+                const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
+                const isCapLimited = dailyCap > 0 && totalUncappedDaily > dailyCap;
+                const headroom = dailyCap > 0 ? dailyCap - totalUncappedDaily : null;
+                const imagerPerYear = effectiveDaily * 365.25;
+                const imageryLifetime = imagerPerYear * (satResults[0].satLifetime || 5);
+                // Max daily potential: highest single-day total across all countries combined
                 const dayTotals = new Float64Array(30);
                 for (const r of satResults) {
                   const cpd = r.sunlitCoveragePerDay || [];
                   for (let d = 0; d < 30; d++) dayTotals[d] += cpd[d] || 0;
                 }
                 const maxDailyPotential = Math.max(...dayTotals);
-                // Avg Daily Demand: realistic WITH per-country cloud penalty applied
-                const avgDailyDemand = satResults.reduce((s, r) => s + ((r.uncappedSunlitAreaByTf[30] || 0) / 30) * (1 - (r.cloudPct||50)/100), 0);
-                const effectiveDaily = dailyCap > 0 ? Math.min(avgDailyDemand, dailyCap) : avgDailyDemand;
-                const utilization = dailyCap > 0 ? (effectiveDaily / dailyCap * 100) : null;
-                const isCapLimited = dailyCap > 0 && avgDailyDemand > dailyCap;
-                const headroom = dailyCap > 0 ? dailyCap - avgDailyDemand : null;
-                const imagerPerYear = effectiveDaily * 365.25;
-                const imageryLifetime = imagerPerYear * (satResults[0].satLifetime || 5);
                 return (
                   <div key={sat.id} style={{ marginBottom: 14, padding: "12px 14px", background: "rgba(4,8,16,0.6)", borderRadius: "0 6px 6px 0", border: `1px solid rgba(70,140,200,0.1)`, borderLeft: `3px solid ${sat.color}` }}>
                     {/* Header */}
@@ -2590,7 +2588,7 @@ export default function App() {
                     {/* A: Daily demand vs capacity */}
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6, marginBottom: 12 }}>
                       {[
-                        ["Avg Daily Demand", `${fmt(avgDailyDemand)} km²/d`, "#FFD740"],
+                        ["Avg Daily Demand", `${fmt(totalUncappedDaily)} km²/d`, "#FFD740"],
                         ["Max Daily Potential", maxDailyPotential > 0 ? `${fmt(maxDailyPotential)} km²/d` : "—", "#FF9800"],
                         ["Daily Capacity", dailyCap > 0 ? `${fmt(dailyCap)} km²/d` : "—", "#64FFDA"],
                         ["Utilization", utilization !== null ? `${utilization.toFixed(0)}%` : "—",
@@ -2616,7 +2614,7 @@ export default function App() {
                         = min(avg demand, capacity) × 365<br />
                         {dailyCap > 0 && isCapLimited
                           ? `Capped at ${fmt(dailyCap)} km²/d capacity`
-                          : `Demand-limited at ${fmt(avgDailyDemand)} km²/d`}
+                          : `Demand-limited at ${fmt(totalUncappedDaily)} km²/d`}
                       </div>
                     </div>
 
@@ -2634,8 +2632,9 @@ export default function App() {
                         {satResults.map((r, ri) => {
                           const grossPerPass = r.avgSunlitPassLengthKm * r.swKm;
                           const annualImagery = (r.sunlitPassCountByTf[30] || 0) * (365.25 / 30) * grossPerPass;
-                          const dailyDemand = ((r.uncappedSunlitAreaByTf[30] || 0) / 30) * (1 - (r.cloudPct||50)/100);
-                          const share = avgDailyDemand > 0 ? (dailyDemand / avgDailyDemand * 100) : 0;
+                          const dailyDemand = (r.uncappedSunlitAreaByTf[30] || 0) / 30;
+                          // Share derived from uncappedSunlitAreaByTf to match km²/yr column exactly
+                          const share = totalUncappedDaily > 0 ? (dailyDemand / totalUncappedDaily * 100) : 0;
                           const shareStr = share < 0.1 ? '<0.1' : share < 10 ? share.toFixed(1) : share.toFixed(0);
                           return (
                             <tr key={ri} style={{ borderBottom: "1px solid rgba(70,140,200,0.05)" }}>
