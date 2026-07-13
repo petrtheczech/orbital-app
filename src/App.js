@@ -265,12 +265,9 @@ function simulateCoverage(sat, cty, tfDays) {
   const swLat = (sw / (2 * Math.PI * R_E)) * 360;
   const maxPerDay = (sat.dataCapacity || 1e9) * (sat.count || 1);
   let dayUsed = 0, curDay = 0;
-  const _ls = cty.latMax - cty.latMin;
-  const _fl = 2 * Math.min(sat.inclination, 180 - sat.inclination);
-  const _mp = Math.ceil((_fl / Math.max(_ls, 0.5)) * 4);
-  const _pp = Math.max(_mp, 500);
-  const _sp = orbits * _pp > 500000 ? Math.max(500, Math.round(500000 / orbits)) : _pp;
-  const track = constellationTrack(sat, orbits, _sp);
+  // Fixed ppo=500: matches computePasses/runAnalysis so track generation is identical
+  // across timeframes (never adaptive, never lower). Worst case ~480 orbits × 500 = 240k pts.
+  const track = constellationTrack(sat, orbits, 500);
   const timeline = [];
   let lastPct = -1;
   const passLines = []; // segments over country
