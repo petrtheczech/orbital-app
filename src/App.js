@@ -142,7 +142,7 @@ function satWithAnchorRaan(sat, anchorCty) {
    ══════════════════════════════════════════════════════════════ */
 const CLOUD_DATA = {
   cz: 65, us: 52, de: 66, fr: 58, gb: 72, ua: 60, pl: 64, es: 40, it: 45, cn: 55,
-  in: 48, ru: 68, br: 62, au: 38, jp: 60, kr: 58, sa: 18, eg: 15, za: 35, ng: 55,
+  in: 48, ru: 68, br: 62, au: 38, jp: 60, kr: 58, tw: 68, sa: 18, eg: 15, za: 35, ng: 55,
   il: 22, tr: 48, ar: 50, ca: 62, mx: 45, id: 70, se: 68, no: 72, ke: 50, co: 65,
   rw: 55, dz: 25, ao: 50, bj: 55, bw: 25, bf: 45, bi: 60, cm: 60, cf: 55, td: 30,
   km: 55, cd: 65, cg: 65, ci: 60, dj: 20, gq: 70, er: 25, sz: 45, et: 45, ga: 70,
@@ -171,6 +171,7 @@ const COUNTRIES = [
   { id:"au", name:"Australia", lat:-25.3, lon:133.8, latMin:-43.6, latMax:-10.1, lonMin:113.2, lonMax:153.6, area:7692024 },
   { id:"jp", name:"Japan", lat:36.2, lon:138.3, latMin:24.4, latMax:45.5, lonMin:122.9, lonMax:153.0, area:377975 },
   { id:"kr", name:"South Korea", lat:35.9, lon:127.8, latMin:33.1, latMax:38.6, lonMin:125.1, lonMax:131.9, area:100210 },
+  { id:"tw", name:"Taiwan", lat:23.7, lon:121.0, latMin:21.9, latMax:25.3, lonMin:120.0, lonMax:122.0, area:36197 },
   { id:"sa", name:"Saudi Arabia", lat:23.9, lon:45.1, latMin:16.4, latMax:32.2, lonMin:34.6, lonMax:55.7, area:2149690 },
   { id:"il", name:"Israel", lat:31.0, lon:34.9, latMin:29.5, latMax:33.3, lonMin:34.3, lonMax:35.9, area:20770 },
   { id:"tr", name:"Turkey", lat:38.9, lon:35.2, latMin:36.0, latMax:42.1, lonMin:26.0, lonMax:44.8, area:783562 },
