@@ -93,7 +93,10 @@ function constellationTrack(sat, numOrbits, ptsPerOrbit) {
     const offset = (360 / count) * s; // evenly space in true anomaly
     const shifted = { ...sat, argPerigee: (sat.argPerigee || 0) + offset };
     const pts = groundTrack(shifted, numOrbits, ptsPerOrbit);
-    allPts.push(...pts);
+    // NOTE: append with a loop, not allPts.push(...pts) — spreading a large
+    // per-member track (100k+ points) overflows the JS argument-count limit
+    // and throws "Maximum call stack size exceeded" for multi-sat constellations.
+    for (let k = 0; k < pts.length; k++) allPts.push(pts[k]);
   }
   // Sort by time so pass detection works correctly
   allPts.sort((a, b) => a.t - b.t);
