@@ -1089,18 +1089,28 @@ function MainMap({ sats, selCtys, countries, onCtClick, anim, showSw, showGr, an
         ctx.fillStyle = "rgba(100,160,200,0.12)"; ctx.beginPath(); ctx.arc(lonX(ct.lon), latY(ct.lat), 2.5, 0, Math.PI * 2); ctx.fill();
       }
     });
-    // Ground tracks
+    // Ground tracks — draw each constellation member as its own track + dot
     sats.forEach(sat => {
-      const track = constellationTrack(sat, 1, 400);
       const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
       const swD = (sw / (2 * Math.PI * R_E)) * 360;
-      if (showSw) { ctx.fillStyle = sat.color + "0a"; track.forEach(pt => { const x = lonX(pt.lon), y = latY(pt.lat), hh = (swD / 180) * MH / 2; ctx.fillRect(x - 1, y - hh, 2, hh * 2); }); }
-      ctx.strokeStyle = sat.color; ctx.lineWidth = 1.5; ctx.shadowColor = sat.color; ctx.shadowBlur = 3; ctx.beginPath();
-      let px = null;
-      track.forEach((pt, i) => { const x = lonX(pt.lon), y = latY(pt.lat); if (i === 0 || (px !== null && Math.abs(x - px) > MW * 0.4)) ctx.moveTo(x, y); else ctx.lineTo(x, y); px = x; });
-      ctx.stroke(); ctx.shadowBlur = 0;
-      const pi = anim % track.length, pos = track[pi];
-      if (pos) { ctx.beginPath(); ctx.arc(lonX(pos.lon), latY(pos.lat), 4, 0, Math.PI * 2); ctx.fillStyle = sat.color; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.stroke(); ctx.fillStyle = sat.color; ctx.font = "bold 8px 'IBM Plex Mono', monospace"; ctx.fillText(sat.name, lonX(pos.lon) + 7, latY(pos.lat) - 5); }
+      const cnt = sat.count || 1;
+      for (let s = 0; s < cnt; s++) {
+        const offset = (360 / cnt) * s;
+        const memberSat = { ...sat, argPerigee: (sat.argPerigee || 0) + offset, count: 1 };
+        const track = groundTrack(memberSat, 1, 400);
+        // Members beyond the first are drawn at ~70% opacity so overlapping tracks stay readable
+        const col = s === 0 ? sat.color : sat.color + "b3";
+        if (showSw) { ctx.fillStyle = sat.color + "0a"; track.forEach(pt => { const x = lonX(pt.lon), y = latY(pt.lat), hh = (swD / 180) * MH / 2; ctx.fillRect(x - 1, y - hh, 2, hh * 2); }); }
+        ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.shadowColor = col; ctx.shadowBlur = 3; ctx.beginPath();
+        let px = null;
+        track.forEach((pt, i) => { const x = lonX(pt.lon), y = latY(pt.lat); if (i === 0 || (px !== null && Math.abs(x - px) > MW * 0.4)) ctx.moveTo(x, y); else ctx.lineTo(x, y); px = x; });
+        ctx.stroke(); ctx.shadowBlur = 0;
+        const pi = anim % track.length, pos = track[pi];
+        if (pos) {
+          ctx.beginPath(); ctx.arc(lonX(pos.lon), latY(pos.lat), 4, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 1; ctx.stroke();
+          if (s === 0) { ctx.fillStyle = sat.color; ctx.font = "bold 8px 'IBM Plex Mono', monospace"; ctx.fillText(sat.name, lonX(pos.lon) + 7, latY(pos.lat) - 5); }
+        }
+      }
     });
   }, [sats, selCtys, countries, anim, showSw, showGr, anchorId]);
   const handleClick = e => {
