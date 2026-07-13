@@ -3,6 +3,7 @@ import jsPDF from "jspdf";
 import html2canvas from "html2canvas";
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, TextRun, ImageRun, WidthType, AlignmentType, HeadingLevel } from "docx";
 import { saveAs } from "file-saver";
+import ConstellationStudy from "./ConstellationStudy";
 
 /* ══════════════════════════════════════════════════════════════
    CONSTANTS & PHYSICS
@@ -85,9 +86,22 @@ function isInImagingWindow(tSeconds, latDeg, lonDeg, dayOfYear = 80) {
    evenly spaced in the same orbital plane (different argPerigee offsets).
    This correctly models revisit improvement from multiple co-planar sats. */
 function constellationTrack(sat, numOrbits, ptsPerOrbit) {
+  // Multi-plane fleet: sat.members is an array of distinct satellites, each with its
+  // own RAAN / inclination / count (i.e. separate orbital planes, not co-planar phasing).
+  // Merge every member's track so downstream coverage/track logic sees the whole fleet.
+  if (Array.isArray(sat.members) && sat.members.length) {
+    const fleetPts = [];
+    for (const m of sat.members) {
+      const pts = constellationTrack(m, numOrbits, ptsPerOrbit);
+      for (let k = 0; k < pts.length; k++) fleetPts.push(pts[k]);
+    }
+    fleetPts.sort((a, b) => a.t - b.t);
+    return fleetPts;
+  }
+
   const count = sat.count || 1;
   if (count <= 1) return groundTrack(sat, numOrbits, ptsPerOrbit);
-  
+
   const allPts = [];
   for (let s = 0; s < count; s++) {
     const offset = (360 / count) * s; // evenly space in true anomaly
@@ -247,6 +261,13 @@ const PRESETS = [
   // ── TRL Space Satellites ──
   { id:"troll_ng", name:"TROLL NG", altitude:520, inclination:97.5, eccentricity:0.0001, raan:0, argPerigee:0, swathAngle:1.07, offNadir:0, dataCapacity:70000, lifetime:5, type:"Hyperspectral", gsd:"4.75m", mass:"<16 kg", desc:"Hyperspectral 32-band nanosatellite (8U CubeSat)" },
   { id:"trap", name:"TRAP", altitude:510, inclination:97.4, eccentricity:0.0001, raan:0, argPerigee:0, swathAngle:0.56, offNadir:30, dataCapacity:8000, lifetime:7, type:"Defence EO", gsd:"0.9m (0.7m proc.)", mass:"<100 kg", desc:"Defence EO microsatellite, PAN+RGB, on-board AI" },
+  // ── TRAP-TW: Taiwan-optimized 3-plane Walker constellation (26°:3/3/0 @ 510 km).
+  //    Trade study 2026-07: 2.6 h mean revisit / 4.5 h max gap over Taiwan (vs 53.5 h / 84 h for SSO TRAP).
+  //    RAANs 0/120/240° are relative plane spacing — do NOT use Anchor mode with these presets,
+  //    satWithAnchorRaan() would override RAAN and collapse the plane geometry.
+  { id:"trap_tw_a", name:"TRAP-TW A", altitude:510, inclination:26.0, eccentricity:0.0001, raan:0, argPerigee:0, swathAngle:0.56, offNadir:30, dataCapacity:8000, lifetime:7, type:"Defence EO", gsd:"0.9m (0.7m proc.)", mass:"<100 kg", desc:"Taiwan-optimized TRAP, Walker plane A (RAAN 0°)" },
+  { id:"trap_tw_b", name:"TRAP-TW B", altitude:510, inclination:26.0, eccentricity:0.0001, raan:120, argPerigee:0, swathAngle:0.56, offNadir:30, dataCapacity:8000, lifetime:7, type:"Defence EO", gsd:"0.9m (0.7m proc.)", mass:"<100 kg", desc:"Taiwan-optimized TRAP, Walker plane B (RAAN 120°)" },
+  { id:"trap_tw_c", name:"TRAP-TW C", altitude:510, inclination:26.0, eccentricity:0.0001, raan:240, argPerigee:0, swathAngle:0.56, offNadir:30, dataCapacity:8000, lifetime:7, type:"Defence EO", gsd:"0.9m (0.7m proc.)", mass:"<100 kg", desc:"Taiwan-optimized TRAP, Walker plane C (RAAN 240°)" },
   { id:"trace", name:"TRACE", altitude:500, inclination:97.4, eccentricity:0.0001, raan:0, argPerigee:0, swathAngle:0.63, offNadir:45, dataCapacity:20000, lifetime:7, type:"VHR MS", gsd:"50cm PAN (40cm proc.)", mass:"<200 kg", desc:"VHR multispectral surveillance, PAN+MS (6 bands), on-board AI" },
   // ── Reference Satellites ──
   { id:"sentinel2", name:"Sentinel-2A", altitude:786, inclination:98.5, eccentricity:0.0001, raan:160, argPerigee:0, swathAngle:10.3, offNadir:0, dataCapacity:1600000, lifetime:7.25, type:"EO", gsd:"10m MS", mass:"1140 kg", desc:"ESA Copernicus wide-swath multispectral" },
@@ -456,12 +477,68 @@ function computePasses(sat, cty, numDays, startT = 0) {
   return { passPolys, covPct: pct, swDegLat, passes, passMidTimes, passLengthsKm };
 }
 
+/* Fleet pass detection: run computePasses for every satellite in satList and UNION the
+   results, tagging each pass with its satellite's colour. Passes are detected per-satellite
+   (so two spacecraft over the target at the same instant stay two distinct passes, and their
+   swath polygons never zig-zag between planes), then merged and re-sorted chronologically so
+   revisit / gap metrics reflect the whole constellation. Coverage % is the union of every
+   satellite's covered cells. Return shape matches computePasses plus a per-pass passColors[]. */
+function computeFleetPasses(satList, cty, numDays, startT = 0) {
+  const gN = 30;
+  const dLat = cty.latMax - cty.latMin, dLon = cty.lonMax - cty.lonMin;
+  const cov = new Uint8Array(gN * gN);
+  const items = []; // { poly, pass, midT, lengthKm, color }
+
+  for (const sat of satList) {
+    const r = computePasses(sat, cty, numDays, startT);
+    const swDegLat = r.swDegLat;
+    for (let i = 0; i < r.passes.length; i++) {
+      items.push({
+        poly: r.passPolys[i], pass: r.passes[i],
+        midT: r.passMidTimes[i], lengthKm: r.passLengthsKm[i],
+        color: sat.color || "rgba(15,70,200,0.85)",
+      });
+    }
+    // Union this satellite's swath coverage into the shared grid
+    for (const pass of r.passes) {
+      for (const p of pass) {
+        const cosL = Math.max(Math.cos(p.lat * DEG), 0.05);
+        const halfLon = swDegLat / 2 / cosL;
+        for (let gi = 0; gi < gN; gi++) {
+          const gLat = cty.latMin + (gi + 0.5) * dLat / gN;
+          if (Math.abs(gLat - p.lat) > swDegLat / 2) continue;
+          for (let gj = 0; gj < gN; gj++) {
+            const gLon = cty.lonMin + (gj + 0.5) * dLon / gN;
+            if (Math.abs(gLon - p.lon) > halfLon) continue;
+            cov[gi * gN + gj] = 1;
+          }
+        }
+      }
+    }
+  }
+
+  items.sort((a, b) => a.midT - b.midT);
+  const covPct = (cov.reduce((s, v) => s + v, 0) / (gN * gN) * 100).toFixed(1);
+  return {
+    passPolys: items.map(it => it.poly),
+    passes: items.map(it => it.pass),
+    passMidTimes: items.map(it => it.midT),
+    passLengthsKm: items.map(it => it.lengthKm),
+    passColors: items.map(it => it.color),
+    covPct,
+  };
+}
+
 /* Render a ground-track map to a JPEG data URL with OSM tile background.
    Replicates the full CountryTrackMap appearance: tiles → country border → swath
    bands → track lines → info badges. Uses crossOrigin="anonymous" so OSM tiles
    (which serve Access-Control-Allow-Origin: *) can be drawn to a readable canvas. */
-async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, W = 600, H = 480, allCountries = null) {
-  const { passPolys, passes, passMidTimes, passLengthsKm } = computePasses(sat, cty, tfDays, anchorOffset);
+async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnly, W = 600, H = 480, allCountries = null, fleetSats = null) {
+  const fleet = fleetSats && fleetSats.length ? fleetSats : null;
+  const primarySat = fleet ? fleet[0] : sat;
+  const { passPolys, passColors, passes, passMidTimes, passLengthsKm } = fleet
+    ? computeFleetPasses(fleet, cty, tfDays, anchorOffset)
+    : computePasses(sat, cty, tfDays, anchorOffset);
   const midLat = (cty.latMin + cty.latMax) / 2;
   const midLon = (cty.lonMin + cty.lonMax) / 2;
   const sunlitIdxs = passes.map((_, i) => i).filter(i => isInImagingWindow(passMidTimes[i], midLat, midLon));
@@ -568,7 +645,6 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
 
   // ── Track center lines (no swath corridor — only nadir track lines) ──
   ctx.save();
-  ctx.strokeStyle = 'rgba(15,70,200,0.85)';
   ctx.lineWidth = 2;
   for (let pi = 0; pi < passPolys.length; pi++) {
     const poly = passPolys[pi];
@@ -579,6 +655,7 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
       p.lon >= vLonMin - 1 && p.lon <= vLonMax + 1
     );
     if (!inView) continue;
+    ctx.strokeStyle = (passColors && passColors[pi]) || 'rgba(15,70,200,0.85)';
     ctx.beginPath();
     poly.center.forEach((p, i) => { if (i === 0) ctx.moveTo(tX(p.lon), tY(p.lat)); else ctx.lineTo(tX(p.lon), tY(p.lat)); });
     ctx.stroke();
@@ -586,13 +663,13 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
   ctx.restore();
 
   // ── Info badge (top-left) ──
-  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
+  const sw = effSwathKm(primarySat.altitude, primarySat.swathAngle || 10);
   const covKm2 = sunlitIdxs.reduce((s, i) => s + sw * (passLengthsKm[i] || 0), 0);
   const fmtA = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(1)}k` : v.toFixed(0);
   const lines = [
     { text: cty.name, font: 'bold 14px monospace', fill: '#ffffff' },
-    { text: sat.name, font: 'bold 11px monospace', fill: sat.color || '#64FFDA' },
-    { text: `${sat.altitude}km · ${sat.inclination}° · ${sw.toFixed(0)}km swath · ${sunlitOnly ? sunlitIdxs.length : passes.length}${sunlitOnly ? ' ☀' : ''} passes/${tfDays}d`, font: '9px monospace', fill: 'rgba(200,220,240,0.65)' },
+    { text: fleet ? `Constellation · ${fleet.length} sats` : sat.name, font: 'bold 11px monospace', fill: primarySat.color || '#64FFDA' },
+    { text: `${primarySat.altitude}km · ${primarySat.inclination}° · ${sw.toFixed(0)}km swath · ${sunlitOnly ? sunlitIdxs.length : passes.length}${sunlitOnly ? ' ☀' : ''} passes/${tfDays}d`, font: '9px monospace', fill: 'rgba(200,220,240,0.65)' },
     covKm2 > 0 ? { text: `☀ ${fmtA(covKm2)} km² imaged / ${fmtA(cty.area)} km²`, font: 'bold 10px monospace', fill: '#64FFDA' } : null,
   ].filter(Boolean);
   const badgeH = lines.length * 16 + 12;
@@ -607,12 +684,12 @@ async function renderTrackMapToDataURL(sat, cty, anchorOffset, tfDays, sunlitOnl
   ctx.restore();
 
   // ── Orbital params badge (bottom-left) ──
-  const T = orbPeriod(sat.altitude);
+  const T = orbPeriod(primarySat.altitude);
   const cosM = Math.cos(midLat * DEG);
   const gapKm = ((360 / (86400 / T)) * (2 * Math.PI * R_E / 360) * cosM).toFixed(0);
   const params = [
     ['Orbits/d', (86400 / T).toFixed(1)],
-    ['Ω̇', `${nodalPrec(sat.altitude, sat.inclination, sat.eccentricity || 0).toFixed(2)}°/d`],
+    ['Ω̇', `${nodalPrec(primarySat.altitude, primarySat.inclination, primarySat.eccentricity || 0).toFixed(2)}°/d`],
     ['Gap', `~${gapKm}km`],
     ['Area', `${(cty.area/1000).toFixed(0)}k km²`],
   ];
@@ -720,7 +797,12 @@ function useMapImage(viewBounds, svgW, svgH) {
   return tile;
 }
 
-function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height = 440, extraCountries = null, anchorCtyId = null }) {
+function CountryTrackMap({ country, sat, fleetSats = null, anchorOffset = 0, width = 500, height = 440, extraCountries = null, anchorCtyId = null }) {
+  // Fleet mode: fleetSats is an array of satellites analysed as one constellation.
+  // Passes from every satellite are unioned (each drawn in its own colour). primarySat
+  // supplies the scalar orbital read-outs (altitude / inclination / swath) for the overlay.
+  const fleet = fleetSats && fleetSats.length ? fleetSats : null;
+  const primarySat = fleet ? fleet[0] : sat;
   const [tfIdx, setTfIdx] = useState(2);
   const [sunlitOnly, setSunlitOnly] = useState(false);
   const tfDays = TRACK_TF_OPTS[tfIdx].d;
@@ -744,11 +826,16 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
     area: drawCountries.reduce((s, c) => s + c.area, 0),
   } : country;
 
-  const { passPolys, covPct, passes, passMidTimes, passLengthsKm } = useMemo(
-    () => computePasses(sat, cty, tfDays, anchorOffset),
+  const fleetKey = fleet
+    ? fleet.map(s => `${s.altitude}|${s.inclination}|${s.eccentricity}|${s.raan}|${s.argPerigee}|${s.swathAngle}|${s.offNadir}|${s.count || 1}`).join(';')
+    : '';
+  const { passPolys, passColors, passes, passMidTimes, passLengthsKm } = useMemo(
+    () => fleet
+      ? computeFleetPasses(fleet, cty, tfDays, anchorOffset)
+      : computePasses(sat, cty, tfDays, anchorOffset),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sat.altitude, sat.inclination, sat.eccentricity, sat.raan, sat.argPerigee,
-     sat.swathAngle, sat.offNadir, cty.id, tfDays, anchorOffset]
+    [fleetKey, primarySat.altitude, primarySat.inclination, primarySat.eccentricity, primarySat.raan, primarySat.argPerigee,
+     primarySat.swathAngle, primarySat.offNadir, cty.id, tfDays, anchorOffset]
   );
 
   const midLat = (cty.latMin + cty.latMax) / 2;
@@ -759,10 +846,14 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
     ? passes.filter((_, i) => sunlitIdxs.includes(i))
     : passes;
 
-  // Sunlit covered area (always sunlit-only, regardless of toggle), capped at daily capacity
-  const swKm = effSwathKm(sat.altitude, sat.swathAngle || 10);
+  // Sunlit covered area (always sunlit-only, regardless of toggle), capped at daily capacity.
+  // Fleet mode uses the primary satellite's swath for the area estimate and the SUM of every
+  // member's daily capacity as the cap.
+  const swKm = effSwathKm(primarySat.altitude, primarySat.swathAngle || 10);
   const uncappedCovKm2 = sunlitIdxs.reduce((sum, i) => sum + swKm * (passLengthsKm[i] || 0), 0);
-  const dailyCap = sat.dataCapacity || 0;
+  const dailyCap = fleet
+    ? fleet.reduce((s, m) => s + (m.dataCapacity || 0) * (m.count || 1), 0)
+    : (sat.dataCapacity || 0);
   const covKm2 = dailyCap > 0 ? Math.min(uncappedCovKm2, dailyCap * tfDays) : uncappedCovKm2;
   const fmtKm2 = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}M` : v >= 1e3 ? `${(v/1e3).toFixed(1)}k` : v.toFixed(0);
 
@@ -862,8 +953,8 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
   for (let la = Math.ceil((vLatMin) / gStep) * gStep; la <= vLatMax; la += gStep) latLines.push(la);
   for (let lo = Math.ceil((vLonMin) / gStep) * gStep; lo <= vLonMax; lo += gStep) lonLines.push(lo);
 
-  const T = orbPeriod(sat.altitude);
-  const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
+  const T = orbPeriod(primarySat.altitude);
+  const sw = effSwathKm(primarySat.altitude, primarySat.swathAngle || 10);
   const gapKm = ((360 / (86400 / T)) * (2 * Math.PI * R_E / 360) * cosM).toFixed(0);
 
   return (
@@ -953,7 +1044,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
               );
               if (!inView) return null;
               const d = poly.center.map((p, i) => `${i === 0 ? "M" : "L"}${tX(p.lon).toFixed(1)},${tY(p.lat).toFixed(1)}`).join(" ");
-              return <path key={`tk${pi}`} d={d} fill="none" stroke="rgba(15,70,200,0.85)" strokeWidth="2" />;
+              return <path key={`tk${pi}`} d={d} fill="none" stroke={(passColors && passColors[pi]) || "rgba(15,70,200,0.85)"} strokeWidth="2" />;
             })}
           </g>
 
@@ -976,9 +1067,11 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
           maxWidth: "60%"
         }}>
           <div style={{ color: "#fff", fontSize: 13, fontWeight: 700, fontFamily: "'IBM Plex Mono',monospace" }}>{cty.name}</div>
-          <div style={{ color: sat.color, fontSize: 10, fontWeight: 600, fontFamily: "'IBM Plex Mono',monospace", marginTop: 2 }}>{sat.name}</div>
+          <div style={{ color: primarySat.color, fontSize: 10, fontWeight: 600, fontFamily: "'IBM Plex Mono',monospace", marginTop: 2 }}>
+            {fleet ? `Constellation · ${fleet.length} sats` : primarySat.name}
+          </div>
           <div style={{ color: "rgba(200,220,240,0.6)", fontSize: 8, fontFamily: "'IBM Plex Mono',monospace", marginTop: 3, lineHeight: 1.4 }}>
-            {sat.altitude}km · {sat.inclination}° · {sw.toFixed(0)}km swath · {visiblePasses.length}{sunlitOnly ? ' ☀' : ''} passes/{tfDays}d
+            {primarySat.altitude}km · {primarySat.inclination}° · {sw.toFixed(0)}km swath · {visiblePasses.length}{sunlitOnly ? ' ☀' : ''} passes/{tfDays}d
           </div>
           {covKm2 > 0 && (
             <div style={{ marginTop: 4, fontSize: 9, fontFamily: "'IBM Plex Mono',monospace", color: "#64FFDA", fontWeight: 600 }}>
@@ -998,7 +1091,7 @@ function CountryTrackMap({ country, sat, anchorOffset = 0, width = 500, height =
         }}>
           {[
             ["Orbits/day", (86400 / T).toFixed(1)],
-            ["Ω̇", `${nodalPrec(sat.altitude, sat.inclination, sat.eccentricity || 0).toFixed(2)}°/d`],
+            ["Ω̇", `${nodalPrec(primarySat.altitude, primarySat.inclination, primarySat.eccentricity || 0).toFixed(2)}°/d`],
             ["Gap", `~${gapKm}km`],
             ["Area", `${(cty.area/1000).toFixed(0)}k km²`],
           ].map(([k, v]) => (
@@ -1177,6 +1270,10 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [studyOpen, setStudyOpen] = useState(false);
+  // "individual" = analyse each satellite on its own (one result row per sat × country).
+  // "constellation" = merge every satellite into one fleet (one merged row/map per country).
+  const [analysisMode, setAnalysisMode] = useState("individual");
   const mainRef = useRef(null);
   const selCtyObjs = COUNTRIES.filter(c => selCtys.includes(c.id));
   const [combinedView, setCombinedView] = useState(false);
@@ -1198,6 +1295,23 @@ export default function App() {
   const combinedViewValid = Boolean(combinedBounds);
   // Auto-reset combined view when fewer than 2 countries are selected
   useEffect(() => { if (!combinedViewValid) setCombinedView(false); }, [combinedViewValid]);
+
+  // Synthetic "fleet" entity used across the results UI when in constellation mode. It mirrors
+  // the merged satellite runAnalysis builds (id 'fleet', summed capacity, members = all sats),
+  // so results.filter(r => r.satId === entity.id) works for both modes. In individual mode the
+  // analysis entities are just the real satellites.
+  const fleetEntity = useMemo(() => {
+    if (analysisMode !== 'constellation' || !sats.length) return null;
+    const rep = sats[0];
+    return {
+      ...rep, id: 'fleet', name: `Constellation (${sats.length} sats)`, color: rep.color,
+      members: sats.slice(), count: 1,
+      dataCapacity: sats.reduce((s, m) => s + (m.dataCapacity || 0) * (m.count || 1), 0),
+      lifetime: Math.min(...sats.map(m => m.lifetime || 5)),
+      fleetCount: sats.reduce((s, m) => s + (m.count || 1), 0),
+    };
+  }, [analysisMode, sats]);
+  const analysisEntities = useMemo(() => fleetEntity ? [fleetEntity] : sats, [fleetEntity, sats]);
   const [commercialRate, setCommercialRate] = useState(15); // €/km²
   const [form, setForm] = useState({
     name: "", altitude: 500, inclination: 97.4, eccentricity: 0.001,
@@ -1254,17 +1368,46 @@ export default function App() {
       const res = [];
       const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
 
-      sats.forEach(sat => {
-        // If anchor is set, override RAAN to optimize first pass over anchor country
-        const effectiveSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+      // Build analysis groups. Individual mode → one group per satellite (RAAN anchored as
+      // before). Constellation mode → a single group whose members are every satellite, kept
+      // at their own RAANs (anchor RAAN override would collapse multi-plane spacing) and merged
+      // into one synthetic fleet satellite for coverage/capacity.
+      const groups = analysisMode === 'constellation'
+        ? [(() => {
+            const members = sats.slice();
+            const rep = members[0];
+            const fleetSat = {
+              ...rep, id: 'fleet', name: `Constellation (${members.length} sats)`,
+              color: rep.color, members, count: 1,
+              dataCapacity: members.reduce((s, m) => s + (m.dataCapacity || 0) * (m.count || 1), 0),
+              lifetime: Math.min(...members.map(m => m.lifetime || 5)),
+            };
+            return { members, effectiveSat: fleetSat, srcSat: null,
+                     fleetCount: members.reduce((s, m) => s + (m.count || 1), 0) };
+          })()]
+        : sats.map(sat => {
+            const eff = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+            return { members: [eff], effectiveSat: eff, srcSat: sat, fleetCount: eff.count || 1 };
+          });
 
-        // Find time (seconds) of anchor's first pass mid-point — day 0 for all revisit buckets.
+      groups.forEach(group => {
+        const effectiveSat = group.effectiveSat;
+        const analysisMembers = group.members;
+        const srcSat = group.srcSat;
+
+        // Anchor offset (day 0 for revisit buckets) = earliest pass of any member over the anchor.
         // Use 5 days and mid-indexed point to match anchorFirstPassTimes and computePasses.
         let anchorFirstPassT = 0;
         if (anchorObj) {
-          const { passes: anchorPasses } = computePasses(effectiveSat, anchorObj, 5);
-          anchorFirstPassT = anchorPasses.length > 0
-            ? anchorPasses[0][Math.floor(anchorPasses[0].length / 2)].t : 0;
+          let best = Infinity;
+          for (const m of analysisMembers) {
+            const { passes: anchorPasses } = computePasses(m, anchorObj, 5);
+            if (anchorPasses.length > 0) {
+              const t = anchorPasses[0][Math.floor(anchorPasses[0].length / 2)].t;
+              if (t < best) best = t;
+            }
+          }
+          anchorFirstPassT = isFinite(best) ? best : 0;
         }
         const anchorOffsetDays = anchorFirstPassT / 86400;
 
@@ -1309,31 +1452,43 @@ export default function App() {
           // Detect all passes over the country buffer zone.
           // midT = middle-indexed point time — matches computePasses passMidTimes formula exactly,
           // so sunlit classification and window filtering are consistent with CountryTrackMap.
-          const allPasses = [];
-          let curP = null;
-          const flushPass = () => {
-            const midIdx = Math.floor(curP.points.length / 2);
-            const midT = curP.points[midIdx].t;
-            allPasses.push({ midT, trackLengthKm: passTrackLength(curP.points, cty) });
-            curP = null;
-          };
-          for (let pi = 0; pi < trackPts.length; pi++) {
-            const p = trackPts[pi];
-            const overBuf = p.lat >= cty.latMin - latBuf && p.lat <= cty.latMax + latBuf &&
-                            p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
-            if (overBuf) {
-              if (!curP) {
-                curP = { points: [p] };
-              } else {
-                const dt = p.t - curP.points[curP.points.length - 1].t;
-                if (dt > T * 0.4) { flushPass(); curP = { points: [p] }; }
-                else curP.points.push(p);
+          // Detect passes PER member satellite, then union — so two satellites over the target
+          // at the same instant remain two distinct passes (correct fleet revisit) rather than
+          // being merged into one. In individual mode there is a single member, so this is
+          // identical to the previous single-track detection.
+          const detectPasses = (pts) => {
+            const out = [];
+            let curP = null;
+            const flushPass = () => {
+              const midIdx = Math.floor(curP.points.length / 2);
+              out.push({ midT: curP.points[midIdx].t, trackLengthKm: passTrackLength(curP.points, cty) });
+              curP = null;
+            };
+            for (let pi = 0; pi < pts.length; pi++) {
+              const p = pts[pi];
+              const overBuf = p.lat >= cty.latMin - latBuf && p.lat <= cty.latMax + latBuf &&
+                              p.lon >= cty.lonMin - lonBuf && p.lon <= cty.lonMax + lonBuf;
+              if (overBuf) {
+                if (!curP) {
+                  curP = { points: [p] };
+                } else {
+                  const dt = p.t - curP.points[curP.points.length - 1].t;
+                  if (dt > T * 0.4) { flushPass(); curP = { points: [p] }; }
+                  else curP.points.push(p);
+                }
+              } else if (curP) {
+                flushPass();
               }
-            } else if (curP) {
-              flushPass();
             }
+            if (curP) flushPass();
+            return out;
+          };
+          const allPasses = [];
+          for (const m of analysisMembers) {
+            const memberTrack = analysisMembers.length === 1 ? trackPts : constellationTrack(m, nOrbits30, 500);
+            for (const ps of detectPasses(memberTrack)) allPasses.push(ps);
           }
-          if (curP) flushPass();
+          allPasses.sort((a, b) => a.midT - b.midT);
 
           // All filtering uses midT/86400 (days) — matches computePasses window logic exactly
           const inWindow = (p, start, end) => p.midT / 86400 >= start && p.midT / 86400 <= end;
@@ -1528,8 +1683,7 @@ export default function App() {
           for (let i = 0; i < gN * gN; i++) {
             if (sfirstVisit[i] < sMinFirst) sMinFirst = sfirstVisit[i];
           }
-          const sunlitFirstImgBest = sMinFirst === Infinity ? null : sMinFirst - anchorOffsetDays;
-          
+
           // Grid-based first-visit (for 100% coverage day and first-image times)
           const firstVisit = new Float64Array(gN * gN).fill(Infinity);
           const lastVisit = new Float64Array(gN * gN).fill(-1);
@@ -1553,30 +1707,30 @@ export default function App() {
             }
           }
 
-          let minFirstVisit = Infinity, maxFirstVisit = 0, visitedCells = 0;
+          let minFirstVisit = Infinity, maxFirstVisit = 0;
           for (let i = 0; i < gN * gN; i++) {
             if (firstVisit[i] < Infinity) {
               if (firstVisit[i] < minFirstVisit) minFirstVisit = firstVisit[i];
               if (firstVisit[i] > maxFirstVisit) maxFirstVisit = firstVisit[i];
-              visitedCells++;
             }
           }
           const firstImgBest = minFirstVisit === Infinity ? null : minFirstVisit - anchorOffsetDays;
           const firstImgWorst = maxFirstVisit === 0 ? null : maxFirstVisit - anchorOffsetDays;
 
           res.push({
-            satId: sat.id, satName: sat.name, satColor: sat.color, countryId: cty.id, countryName: cty.name,
+            satId: effectiveSat.id, satName: effectiveSat.name, satColor: effectiveSat.color, countryId: cty.id, countryName: cty.name,
             area: cty.area, timeline, passLines, finalPct, fullCovDay,
             cloudPct, clearFrac, lifetime: lt,
             covsPerYear: finalPct >= 100 ? covsPerYear : 0,
             covsLifetime: finalPct >= 100 ? covsLifetime : 0,
             grossImgLifetime, netImgLifetime,
             grossImgPerYear, netImgPerYear,
-            label: `${sat.name}${(effectiveSat.count || 1) > 1 ? " ×" + (effectiveSat.count || 1) : ""} → ${cty.name}`,
-            satCount: effectiveSat.count || 1,
+            label: `${effectiveSat.name}${group.fleetCount > 1 ? " ×" + group.fleetCount : ""} → ${cty.name}`,
+            satCount: group.fleetCount,
+            isConstellation: analysisMode === 'constellation',
             isAnchor: cty.id === anchorCty,
             effectiveRaan: effectiveSat.raan,
-            originalRaan: sat.raan,
+            originalRaan: srcSat ? srcSat.raan : effectiveSat.raan,
             firstImgBest, firstImgWorst,
             firstAllPassDay, meanRevisitDays, maxGapDays,
             firstSunlitPassDay, sunlitMeanRevisitDays, sunlitMaxGapDays,
@@ -1707,7 +1861,7 @@ export default function App() {
 
       // ── UTILIZATION TABLE (satellite summary + per-country breakdown) ──
       const utilHdr = mkHdr(["Satellite / Country", "Avg Daily Demand", "Max Daily Potential", "Daily Capacity", "Utilization", "Headroom", "Actual km²/yr", "Lifetime km²", "Passes/30d", "km²/pass", "Demand Share"]);
-      const utilRows = sats.flatMap(sat => {
+      const utilRows = analysisEntities.flatMap(sat => {
         const satResults = (results || []).filter(r => r.satId === sat.id);
         if (!satResults.length) return [];
         const dailyCap = satResults[0].satDataCapacity || 0;
@@ -1764,7 +1918,7 @@ export default function App() {
 
       // ── COMMERCIAL VALUE TABLE ──
       const commHdr = mkHdr(["Satellite", "Country", "Passes/30d", "Gross km²/yr", "Cloud%", "Net km²/yr", "Value/yr (net)", "Value/lifetime (net)"]);
-      const commRows = sats.flatMap(sat => {
+      const commRows = analysisEntities.flatMap(sat => {
         const satResults = (results || []).filter(r => r.satId === sat.id);
         return satResults.map(r => {
           const passesPerYear = (r.sunlitPassCountByTf[30]||0) * (365.25/30);
@@ -1792,30 +1946,34 @@ export default function App() {
       // comparison collages. Avoids duplicate OSM tile loads.
       const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
       const mapCache = new Map(); // key: `${sat.id}|${cty.id}|${d}|${sunlit}`
-      // Individual per-country maps (always needed for Section 1 detail grid)
-      for (const sat of sats) {
-        const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+      // Individual per-country maps (always needed for Section 1 detail grid).
+      // In constellation mode analysisEntities is the single merged fleet (id 'fleet'), rendered
+      // with fleetSats so every satellite's passes are unioned; anchor RAAN is not applied to it.
+      for (const sat of analysisEntities) {
+        const isFleet = sat.id === 'fleet';
+        const effSat = (anchorObj && !isFleet) ? satWithAnchorRaan(sat, anchorObj) : sat;
         const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
         for (const cty of selCtyObjs) {
           await Promise.all(
             TRACK_TF_OPTS.flatMap(({ d }) =>
               [false, true].map(async (sunlit) => {
-                const url = await renderTrackMapToDataURL(effSat, cty, anchorOffset, d, sunlit, 600, 480);
+                const url = await renderTrackMapToDataURL(effSat, cty, anchorOffset, d, sunlit, 600, 480, null, isFleet ? sats : null);
                 mapCache.set(`${sat.id}|${cty.id}|${d}|${sunlit}`, url ? dataUrlToUint8Array(url) : null);
               })
             )
           );
         }
       }
-      // Combined view maps (when active: one combined map per sat × timeframe × mode)
+      // Combined view maps (when active: one combined map per entity × timeframe × mode)
       if (combinedView && combinedBounds) {
-        for (const sat of sats) {
-          const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+        for (const sat of analysisEntities) {
+          const isFleet = sat.id === 'fleet';
+          const effSat = (anchorObj && !isFleet) ? satWithAnchorRaan(sat, anchorObj) : sat;
           const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
           await Promise.all(
             TRACK_TF_OPTS.flatMap(({ d }) =>
               [false, true].map(async (sunlit) => {
-                const url = await renderTrackMapToDataURL(effSat, combinedBounds, anchorOffset, d, sunlit, 600, 480, selCtyObjs);
+                const url = await renderTrackMapToDataURL(effSat, combinedBounds, anchorOffset, d, sunlit, 600, 480, selCtyObjs, isFleet ? sats : null);
                 mapCache.set(`${sat.id}|__combined__|${d}|${sunlit}`, url ? dataUrlToUint8Array(url) : null);
               })
             )
@@ -1838,8 +1996,9 @@ export default function App() {
         ],
       });
       const mapChildren = [];
-      for (const sat of sats) {
-        const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+      for (const sat of analysisEntities) {
+        const isFleet = sat.id === 'fleet';
+        const effSat = (anchorObj && !isFleet) ? satWithAnchorRaan(sat, anchorObj) : sat;
         const anchorOffset = anchorFirstPassTimes[sat.id] || 0;
         for (const cty of selCtyObjs) {
           mapChildren.push(new Paragraph({ text: `${sat.name} → ${cty.name}  ·  ${sat.altitude}km / ${sat.inclination}°`, heading: HeadingLevel.HEADING_3 }));
@@ -1853,7 +2012,9 @@ export default function App() {
               ...TRACK_TF_OPTS.map(({ l, d }) => {
                 const allData = getMap(sat.id, cty.id, d, false);
                 const sunData = getMap(sat.id, cty.id, d, true);
-                const { passes: allP, passMidTimes: allMT } = computePasses(effSat, cty, d, anchorOffset);
+                const { passes: allP, passMidTimes: allMT } = isFleet
+                  ? computeFleetPasses(sats, cty, d, anchorOffset)
+                  : computePasses(effSat, cty, d, anchorOffset);
                 const nAll = allP.length;
                 const nSun = allP.filter((_, i) => isInImagingWindow(allMT[i], (cty.latMin+cty.latMax)/2, (cty.lonMin+cty.lonMax)/2)).length;
                 return new TableRow({ children: [
@@ -1871,7 +2032,7 @@ export default function App() {
       // One collage per country per mode (ALL / SUNLIT).
       // Grid: columns = satellites, rows = timeframes.
       // Sized to fit nSats columns on a landscape A4 page.
-      const nSats = sats.length;
+      const nSats = analysisEntities.length;
       const labelPct = Math.max(6, Math.round(60 / Math.max(nSats, 1)));  // shrink label as sats grow
       const imgPct = Math.max(1, Math.floor((100 - labelPct) / Math.max(1, nSats)));
       // Display size in pixels: fill the column (page ~950px wide at 96dpi)
@@ -1909,15 +2070,15 @@ export default function App() {
           }));
           const headerRow = new TableRow({ children: [
             mkCHdr("", labelPct),
-            ...sats.map(sat => {
-              const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+            ...analysisEntities.map(sat => {
+              const effSat = (anchorObj && sat.id !== 'fleet') ? satWithAnchorRaan(sat, anchorObj) : sat;
               return mkCHdr(`${sat.name}\n${effSat.altitude}km · ${effSat.inclination}°`, imgPct);
             }),
           ]});
           const dataRows = TRACK_TF_OPTS.map(({ l, d }) =>
             new TableRow({ children: [
               mkCLbl(l),
-              ...sats.map(sat => mkCImg(getCombinedMap(sat.id, d, sunlit), imgPct)),
+              ...analysisEntities.map(sat => mkCImg(getCombinedMap(sat.id, d, sunlit), imgPct)),
             ]})
           );
           collageChildren.push(new Table({
@@ -1937,15 +2098,15 @@ export default function App() {
             }));
             const headerRow = new TableRow({ children: [
               mkCHdr("", labelPct),
-              ...sats.map(sat => {
-                const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
+              ...analysisEntities.map(sat => {
+                const effSat = (anchorObj && sat.id !== 'fleet') ? satWithAnchorRaan(sat, anchorObj) : sat;
                 return mkCHdr(`${sat.name}\n${effSat.altitude}km · ${effSat.inclination}°`, imgPct);
               }),
             ]});
             const dataRows = TRACK_TF_OPTS.map(({ l, d }) =>
               new TableRow({ children: [
                 mkCLbl(l),
-                ...sats.map(sat => mkCImg(getMap(sat.id, cty.id, d, sunlit), imgPct)),
+                ...analysisEntities.map(sat => mkCImg(getMap(sat.id, cty.id, d, sunlit), imgPct)),
               ]})
             );
             collageChildren.push(new Table({
@@ -1987,7 +2148,7 @@ export default function App() {
       saveAs(blob, "orbital-coverage-analysis.docx");
     } catch (e) { console.error("Word export error:", e); }
     setExporting(false);
-  }, [results, sats, tf, commercialRate, anchorCty, anchorFirstPassTimes, selCtyObjs, combinedView, combinedBounds]);
+  }, [results, sats, analysisEntities, commercialRate, anchorCty, anchorFirstPassTimes, selCtyObjs, combinedView, combinedBounds]);
 
   const tfOpts = [{ l: "1 Day", v: 1 }, { l: "3 Days", v: 3 }, { l: "7 Days", v: 7 }, { l: "16 Days", v: 16 }, { l: "30 Days", v: 30 }, { l: "90 Days", v: 90 }, { l: "1 Year", v: 365 }];
 
@@ -2027,8 +2188,23 @@ export default function App() {
           <span style={{ fontSize: 9, color: "#1a3a50" }}>T+{String(anim).padStart(4, "0")}</span>
           <Btn sm on={playing} onClick={() => setPlaying(!playing)}>{playing ? "▌▌" : "▶"}</Btn>
           <Btn sm onClick={() => setAnim(0)}>↺</Btn>
+          {/* Analysis mode: individual per-satellite vs merged constellation */}
+          <div style={{ display: "flex", border: "1px solid rgba(100,255,218,0.25)", borderRadius: 4, overflow: "hidden" }} title="Individual = one result per satellite. Constellation = all satellites merged into one fleet.">
+            {[["individual", "◉ INDIVIDUAL"], ["constellation", "◈ CONSTELLATION"]].map(([m, lbl]) => (
+              <button key={m} onClick={() => setAnalysisMode(m)}
+                style={{
+                  background: analysisMode === m ? "rgba(100,255,218,0.16)" : "transparent",
+                  border: "none", color: analysisMode === m ? "#64FFDA" : "#3a6888",
+                  padding: "5px 9px", fontSize: 9, fontFamily: "inherit", letterSpacing: 1,
+                  cursor: "pointer", fontWeight: analysisMode === m ? 700 : 400,
+                }}>{lbl}</button>
+            ))}
+          </div>
           <Btn sm on style={{ background: "rgba(100,255,218,0.1)", borderColor: "rgba(100,255,218,0.3)", color: "#64FFDA" }} onClick={runAnalysis}>
             {running ? "⟳ RUNNING..." : "▶ RUN ANALYSIS"}
+          </Btn>
+          <Btn sm on={studyOpen} style={{ background: "rgba(224,64,251,0.08)", borderColor: "rgba(224,64,251,0.3)", color: "#E040FB" }} onClick={() => setStudyOpen(true)}>
+            ◈ CONSTELLATION STUDY
           </Btn>
           {results && (
             <div style={{ position: "relative" }}>
@@ -2049,6 +2225,8 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {studyOpen && <ConstellationStudy countries={COUNTRIES} onClose={() => setStudyOpen(false)} />}
 
       <div style={{ display: "flex", height: "calc(100vh - 58px)" }}>
         {/* ── LEFT PANEL ── */}
@@ -2487,7 +2665,7 @@ export default function App() {
                 <div style={{ marginTop: 14, padding: "10px 12px", background: "rgba(100,255,218,0.04)", border: "1px solid rgba(100,255,218,0.12)", borderRadius: 4 }}>
                   <div style={{ fontSize: 9, color: "#64FFDA", fontWeight: 700, marginBottom: 8, letterSpacing: 1 }}>AGGREGATE ACROSS ALL AOIs</div>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10 }}>
-                    {sats.map(sat => {
+                    {analysisEntities.map(sat => {
                       const satResults = results.filter(r => r.satId === sat.id);
                       if (satResults.length === 0) return null;
                       const bestFirst = Math.min(...satResults.map(r => r.firstAllPassDay).filter(v => v !== null && v !== undefined));
@@ -2525,7 +2703,33 @@ export default function App() {
                 Zoomed maps showing full ground track lines over each target country. Use the timeframe buttons below each map to see track buildup over 1 day → 30 days. Green cells = covered area.
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 8 }}>
-                {combinedView && combinedBounds ? (
+                {analysisMode === 'constellation' ? (
+                  // One merged fleet map per country: every satellite's passes unioned and
+                  // drawn in its own colour. Anchor RAAN override is intentionally NOT applied
+                  // here — it would collapse the multi-plane spacing.
+                  combinedView && combinedBounds ? (() => {
+                    const [first, ...rest] = selCtyObjs;
+                    return (
+                      <CountryTrackMap
+                        key={`fleet-combined`}
+                        country={first}
+                        extraCountries={rest}
+                        anchorCtyId={anchorCty}
+                        fleetSats={sats}
+                        width={900} height={700}
+                      />
+                    );
+                  })() : (
+                    selCtyObjs.map(cty => (
+                      <CountryTrackMap
+                        key={`fleet-${cty.id}`}
+                        country={cty}
+                        fleetSats={sats}
+                        width={500} height={440}
+                      />
+                    ))
+                  )
+                ) : combinedView && combinedBounds ? (
                   sats.map(sat => {
                     const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
                     const effSat = anchorObj ? satWithAnchorRaan(sat, anchorObj) : sat;
@@ -2568,7 +2772,7 @@ export default function App() {
               <div style={{ fontSize: 9, color: "#3a6080", marginBottom: 14, lineHeight: 1.5 }}>
                 Per-satellite capacity analysis across all selected AOIs. Daily demand = total sunlit ground coverage the satellite could image across every country combined.
               </div>
-              {sats.map(sat => {
+              {analysisEntities.map(sat => {
                 const satResults = results.filter(r => r.satId === sat.id);
                 if (!satResults.length) return null;
                 const dailyCap = satResults[0].satDataCapacity;
@@ -2741,7 +2945,7 @@ export default function App() {
                   <span style={{ fontSize: 8, color: "#2a4a60" }}>€/km²</span>
                 </div>
               </div>
-              {sats.map(sat => {
+              {analysisEntities.map(sat => {
                 const satResults = results.filter(r => r.satId === sat.id);
                 if (!satResults.length) return null;
                 const dailyCap = satResults[0].satDataCapacity;
