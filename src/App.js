@@ -260,6 +260,7 @@ function simulateCoverage(sat, cty, tfDays) {
   const lonN = Math.max(4, Math.ceil((cty.lonMax - cty.lonMin) / gridRes));
   const cells = latN * lonN;
   const covered = new Uint8Array(cells);
+  let coveredCount = 0; // running tally — avoids an O(cells) reduce on every track point
   const T = orbPeriod(sat.altitude);
   const orbits = Math.ceil((86400 / T) * tfDays);
   const sw = effSwathKm(sat.altitude, sat.swathAngle || 10);
@@ -294,21 +295,20 @@ function simulateCoverage(sat, cty, tfDays) {
           if (cLon < pt.lon - swLon / 2 || cLon > pt.lon + swLon / 2) continue;
           const ca = cty.area / cells;
           if (dayUsed + ca > maxPerDay) continue;
-          covered[idx] = 1; dayUsed += ca;
+          covered[idx] = 1; dayUsed += ca; coveredCount++;
         }
       }
     } else if (inPass) {
       passLines.push({ from: passStart, to: { lat: track[p - 1].lat, lon: track[p - 1].lon } });
       inPass = false;
     }
-    const cnt = covered.reduce((s, v) => s + v, 0);
-    const pct = Math.round((cnt / cells) * 100);
+    const pct = Math.round((coveredCount / cells) * 100);
     if (pct !== lastPct) { timeline.push({ day, pct }); lastPct = pct; if (pct >= 100) break; }
   }
   if (inPass && track.length > 0) {
     passLines.push({ from: passStart, to: { lat: track[track.length - 1].lat, lon: track[track.length - 1].lon } });
   }
-  const finalPct = covered.reduce((s, v) => s + v, 0) / cells * 100;
+  const finalPct = coveredCount / cells * 100;
   if (timeline.length === 0 || timeline[timeline.length - 1].pct < finalPct) {
     timeline.push({ day: tfDays, pct: Math.round(finalPct) });
   }
@@ -1247,6 +1247,7 @@ export default function App() {
     if (!sats.length || !selCtys.length) return;
     setRunning(true); setResults(null);
     setTimeout(() => {
+      try {
       const res = [];
       const anchorObj = anchorCty ? COUNTRIES.find(c => c.id === anchorCty) : null;
 
@@ -1593,7 +1594,12 @@ export default function App() {
           });
         });
       });
-      setResults(res); setRunning(false); setTab("results");
+      setResults(res); setTab("results");
+      } catch (e) {
+        console.error("Analysis error:", e);
+      } finally {
+        setRunning(false); // never leave the button stuck in the running state
+      }
     }, 60);
   };
 
